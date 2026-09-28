@@ -1,0 +1,22 @@
+# config/external_demo.yml ----------------------------------------------------
+# Paths for the eICU-CRD DEMO (physionet-data.eicu_crd_demo, Open Data Commons
+# ODbL v1.0), extracted by sql/eicu_demo/ (generated from sql/eicu/ by
+# sql/eicu_demo/make_demo_sql.py: same logic, two declared type adapters).
+#
+# Used by run/patient_card.R --site eicu_demo to draw published patient cards
+# from openly licensed stays. FITS NOTHING: the frozen bundle is applied, as at
+# the eICU external site. Paths only; the design comes from the bundle.
+# The severity table is not listed: the card does not read it, and
+# load_tables() loads it only when a path is given.
+# ----------------------------------------------------------------------------
+
+site: eicu
+
+bundle: out/runs/internal_20260909T112643/bundle.qs2
+
+paths:
+  cohort:                 demo/eicu_demo/v2_cohort_eicu_demo.parquet
+  signal_features:        demo/eicu_demo/v2_features_signals_eicu_demo.parquet
+  intervention_features:  demo/eicu_demo/v2_intervention_features_eicu_demo.parquet
+
+hospital_table: demo/eicu_demo/v2_cohort_hospital_eicu_demo.parquet

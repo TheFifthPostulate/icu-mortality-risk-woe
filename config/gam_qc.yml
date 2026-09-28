@@ -1,0 +1,149 @@
+# config/gam_qc.yml ------------------------------------------------------------
+# THE GAM QC PLAN: every threshold, grid and floor that tests/gam_qc.R and
+# tests/gam_qc_bootstrap.R read. Both scripts read every key below through
+# `cfg_req()`, which has NO fallback (audit findings F9 to F11: a value written
+# once in config and once as a script literal can be edited apart and the
+# divergence stays invisible).
+#
+# WHY THIS IS NOT A BLOCK IN config/config.yml. Nothing here changes what the
+# pipeline fits. Adding these keys there would change the `cfg` target's value
+# and rebuild all 384 GAMs to produce identical numbers -- the same argument
+# config/attribution.yml and config/attribution_eval.yml make in their headers.
+#
+# WHAT IS DELIBERATELY NOT HERE. The fit-diagnostic thresholds (`k_index_min`,
+# `edf_ratio_max`, `concurvity_max`, `dev_expl_min`) are read from the BUNDLE's
+# frozen `diagnostics` block, never restated: they were fixed before fitting and
+# a second copy here could drift from the one the graph triaged against. The
+# shared bootstrap bags (`bootstrap.seed_base`, `bootstrap.b`) are read from
+# config/attribution_eval.yml, because a bag is defined in exactly one place.
+# ------------------------------------------------------------------------------
+
+# The bundle of record. An EXPLICIT path, never latest_run(): a QC table must
+# not change because a newer internal run appeared.
+bundle: out/runs/internal_20260909T112643/bundle.qs2
+
+# The targets store, used ONLY for the provenance check (coefficient and frame
+# identity between the bundle and the unstripped final fits). Optional: the QC
+# runs without it and says so.
+store: _targets
+
+# The calibrated concurvity null to join against (tests/concurvity_null.R).
+concurvity_null: out/runs/cnull_20260909T113509
+
+# The attribution generator run whose diagnostics/bootstrap_bags.csv carries the
+# membership hash of every shared bag. The bootstrap script re-derives each bag
+# and STOPS if its hash differs, so "the same bag as the L replicates" is a
+# checked fact rather than a claim.
+attrgen: out/runs/attrgen_20260909T115047
+
+# --- the evaluation grid ------------------------------------------------------
+grid:
+  # 1-D: a uniform grid over [q_lo, q_hi] of the covariate's TRAINING
+  # distribution. The tails beyond are not evaluated at all: a curve drawn to
+  # the 0.1st percentile is drawn for a handful of stays.
+  n_points: 101
+  q_lo: 0.005
+  q_hi: 0.995
+  # A covariate with at most this many distinct values is evaluated AT those
+  # values and nowhere else. The three GCS deltas, the agent counts and the
+  # event-shaped `n_hours` are integer scales, and a uniform grid through them
+  # would be evaluated where no stay can ever be.
+  max_distinct: 25
+  # 2-D (the ti surfaces): points per margin.
+  n_points_2d: 25
+
+# --- the empirical support mask -----------------------------------------------
+# A grid point is SUPPORTED if the bin around it holds at least `min_rows`
+# training stays AND at least `min_events` deaths. Both floors, because a
+# log-odds curve over a bin with 500 survivors and no death is exactly as
+# unidentified as one over an empty bin -- the count alone would call it
+# supported. Fixed BEFORE any curve is read, never chosen after seeing one.
+support:
+  min_rows: 50
+  min_events: 5
+  min_rows_2d: 25
+  min_events_2d: 3
+  # Counted over a WINDOW of grid steps either side of the point, not the
+  # single bin: with 101 points and 41,000 stays a rare intervention's exposed
+  # tail holds a dozen stays per bin and would be called unsupported
+  # everywhere but its atom, which answers "is there a stay in this exact
+  # bin" rather than "is the smooth estimated from anyone near here". Two
+  # steps either side is 5% of the evaluated range. Atom grids use no window.
+  window_half_steps: 2
+  window_half_steps_2d: 1
+
+# --- mgcv::k.check ------------------------------------------------------------
+# `subsample: 0` means ALL rows. mgcv's default subsamples 5,000 rows without
+# a seed, which is how the k-index in diag_final came to be one random draw
+# per fit; on all rows the index is deterministic and only the p-value's
+# randomisation remains, which `seed` pins.
+kcheck:
+  subsample: 0
+  n_rep: 400
+  seed: 5333
+
+# --- residual sanity ----------------------------------------------------------
+residuals:
+  n_bins: 20             # equal-count bins of fitted probability
+  n_bins_covariate: 10   # bins of each smooth covariate for leftover structure
+  z_out: 2               # a bin is "out" when |obs - exp| exceeds this many SE
+  seed: 5333             # the randomised quantile residual draw
+  sep_eps: 1.0e-4        # fitted p below this or above 1 - this counts as separated
+
+# --- what counts as a smoothing parameter at its boundary -------------------
+sp_bounds:
+  huge: 1.0e+5           # penalised to (near) nothing; with bs = "ts" the term is shrunk out
+  tiny: 1.0e-5           # effectively unpenalised
+  shrunk_edf: 0.5        # a term with less EDF than this has been shrunk out
+
+# --- the k-doubling refit -----------------------------------------------------
+# For every s() term whose edf/k' exceeds the bundle's `edf_ratio_max`, refit
+# the model with that term's k multiplied by `multiplier` and measure what
+# moves: deviance explained, the term's EDF, and the curve on the same grid
+# inside support. A saturated basis whose curve does not move is a basis that
+# is large enough; one whose curve keeps changing is not. Only s() terms: a ti
+# margin's k is capped by `k_ti`, which is a design parameter.
+refit_k:
+  enabled: true
+  multiplier: 2
+
+# --- the analytic band --------------------------------------------------------
+band:
+  z: 1.96
+
+# --- reading a curve's direction ---------------------------------------------
+# A smooth is called monotone inside support only when the Spearman
+# correlation of its curve with the covariate reaches this magnitude; below
+# it the curve is reported as NON-MONOTONE (a U or an inverted U), which is a
+# different fact from running against the declared direction.
+interp:
+  monotone_rho_min: 0.5
+  # A curve whose supported range is below this many nats is FLAT: its
+  # direction and extremum count are round-off and are reported as such.
+  flat_range_nats: 0.001
+
+# --- the cut-offs the console summaries COUNT against ------------------------
+# Reporting only. No table is filtered by these; they decide which smooths the
+# summary lines tally as "above" or "below", and they live here so the tally
+# and the sentence that quotes it cannot disagree.
+report:
+  frac_var_outside_high: 0.5   # smooths with more than this share of their variation outside support
+  resolved_low: 0.25           # smooths resolved from zero on less than this share of the supported grid
+
+# --- the bootstrap stability script ----------------------------------------
+bootstrap:
+  # How many of the SHARED bags (config/attribution_eval.yml bootstrap.b) to
+  # refit. Bag b here is bag b there, verified by membership hash.
+  n_bags: 20
+  # Fraction of bags that must agree on a sign for a grid point to be called
+  # sign-stable, and the fraction of bags that must agree with the final fit's
+  # monotone direction for a term to be called direction-stable.
+  sign_stable_frac: 0.90
+  # A smooth whose median bag-to-final shape correlation is below this is
+  # tallied as shape-unstable in the spec roll-up.
+  shape_cor_min: 0.90
+  # Rough seconds per final-shaped fit, for the plan's wall-clock estimate
+  # only. MEASURED 2026-09-08 with the frame cache: 64 fits per bag in 1.1 to
+  # 1.2 minutes, the 21 tensor models included.
+  sec_per_fit: 0.8
+  sec_per_fit_ti: 1.5

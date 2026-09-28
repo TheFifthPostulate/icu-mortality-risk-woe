@@ -1,0 +1,960 @@
+# LLR v2 configuration
+# Single source of truth for paths, whitelists, folds and fit settings.
+# Everything here is a contract enforced by R/02_validate.R
+# (docs/canonical_variable_spec.md §8). Changing a whitelist is a spec change.
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+# Relative to the project root. Nothing under data/ may be read or printed
+# outside the loader (CLAUDE.md hard rule 1).
+paths:
+  pairing: config/pairing.csv
+  # The frozen layer-2 reporting partition. Read by R/09d_sofa.R's
+  # load_domains() for the domain-versus-SOFA-organ comparison, and by layer 2
+  # when it aggregates. Named here rather than hard-coded so that R/09d builds
+  # no path of its own (hard rule 9).
+  domains: config/domains.csv
+  mimiciv:
+    cohort:                 data/mimiciv/v2_cohort_mimiciv.parquet
+    signal_features:        data/mimiciv/v2_features_signals_mimiciv.parquet
+    intervention_features:  data/mimiciv/v2_intervention_features_mimiciv.parquet
+    # AUDIT ONLY as of 2026-08-25. `o_flag` was dropped from the design, and it
+    # was the only modelled column this table carried. What remains is an
+    # independent encoding of the signal x intervention grid, which validator
+    # check 4 still cross-checks against pairing.csv ("two definitions of one
+    # thing will disagree", v2_handoff.md §5). Delete this line to stop loading
+    # it; nothing downstream of the loader will notice.
+    ordering:               data/mimiciv/v2_features_ordering_mimiciv.parquet
+    # COMPARISON ARMS, optional. Written by
+    # sql/mimiciv/v2_06_severity_mimiciv.sql and scored by R/09c_apache.R and
+    # R/09d_sofa.R. One table, two scores. No model frame reads it.
+    #
+    # COMMENTED OUT UNTIL THE EXTRACTION HAS RUN. `load_tables()` errors on a
+    # missing file rather than warning, which is correct — a silently absent
+    # parquet is how a comparison arm quietly stops being computed — but it
+    # means an uncommented path here would break every existing script before
+    # the parquet exists. Uncomment after exporting it; the validator's
+    # severity checks SKIP while it is absent and nothing else notices.
+    severity:             data/mimiciv/v2_severity_mimiciv.parquet
+  # ---------------------------------------------------------------------------
+  # THE eICU PATHS ARE NOT HERE. They live in `config/external.yml`, under
+  # `paths:` and `hospital_table:`, and that is the only place they are read:
+  # `run/external.R` builds its config as `bundle_cfg(bundle, ec$paths)` from
+  # that file.
+  #
+  # An `eicu:` block and an `eicu_hospital:` entry sat here until 2026-09-03,
+  # duplicating those values exactly. Nothing read them (audit finding F6), and
+  # a comment beside `eicu_hospital` claimed `run/external.R` read it, which
+  # had stopped being true. Two declarations of one path that agree today are
+  # the setup for the day they stop agreeing, and the one nothing reads is the
+  # one that will drift.
+  #
+  # An `out:` block (figs / tables / models) sat here too, also unread:
+  # `R/11_run.R` owns the output layout and writes to
+  # `out/runs/<prefix>_<datetime>/`.
+
+# ---------------------------------------------------------------------------
+# Resampling
+# ---------------------------------------------------------------------------
+# Two nested levels, both defined once in R/03_folds.R; everything keys to them.
+#
+#   1. split  - train / test. Test is touched ONCE, for the APACHE II /
+#               SOFA discrimination comparison (SAPS-II dropped 2026-08-31).
+#               Nothing else may look at it.
+#   2. folds  - 5 CV folds INSIDE train, for the out-of-fold L's.
+#
+# Both are stratified on `mortality` and grouped by `patient_id` so repeat stays
+# cannot leak across a boundary. Grouping is applied first: a patient's stratum
+# label is the max of `mortality` over their stays, and patients are assigned
+# whole, so stratification is approximate at the stay level whenever a patient
+# has more than one stay.
+# MEASURED 2026-08-22: in MIMIC-IV, n_subject == n_stay == n_hadm == 51,563 —
+# every patient appears exactly once, so grouping is a no-op here and
+# stratification is exact. The machinery still applies; eICU may differ.
+seed: 5333
+
+split:
+  test_fraction: 0.2
+  stratify_on: mortality
+  group_by: patient_id
+
+n_folds: 5
+fold_stratify_on: mortality
+fold_group_by: patient_id
+
+# ---------------------------------------------------------------------------
+# Guards
+# ---------------------------------------------------------------------------
+# Applied in R/01_load.R, the only place data is repaired.
+#   weight_kg  - out-of-range values are set to NA (not dropped). Applied in
+#                SQL as of the 2026-08-22 re-extraction, so normally a no-op;
+#                it stays because urine_output_rate is mL/kg/hr and a 1 kg
+#                weight inflates that paired signal ~70x.
+#   age_max    - ASSERTION ONLY, never a repair. The cap belongs in SQL
+#                (LEAST(age, 90)) so that MIMIC matches eICU's >89 -> 90.
+#                Capping in R would hide a re-extraction that forgot it.
+guards:
+  weight_kg_min: 30
+  weight_kg_max: 300
+  age_max: 90
+
+# ---------------------------------------------------------------------------
+# Whitelists
+# ---------------------------------------------------------------------------
+# The 19 canonical signals (spec §3). The last seven are the unpaired control
+# signals; the internal contrast the paper turns on. Nothing may be added
+# after fitting begins.
+# NOTE: `mbp`, not `map` — the spec doc is wrong and the SQL is right
+# (CLAUDE.md, frozen decisions).
+signals:
+  - mbp
+  - heart_rate
+  - spo2
+  - resp_rate
+  - glucose
+  - gcs_motor
+  - gcs_eyes
+  - gcs_verbal
+  - urine_output_rate
+  - creatinine
+  - platelet
+  - hemoglobin
+  - temperature
+  - sodium
+  - bicarbonate
+  - bun
+  - wbc
+  - lactate
+  - bilirubin_total
+
+signal_classes: [dense, rate, sparse]
+
+# Which pi coordinates enter a formula, per signal. Default: both.
+#
+# pi_hat is a 3-simplex, so pi_minus and pi_plus are two FREE coordinates of one
+# object and both normally enter — dropping one is a projection, not a variable
+# removal. Two patients with identical k_low and n_obs but different k_high have
+# identical pi_minus; only pi_plus separates a purely hypotensive patient from a
+# labile one. `excursion_side` does NOT govern this: it selects the tail
+# quantile (q05 vs q95), and MAP is paired on the low side
+# while its high tail still carries information.
+#
+# The exception is a coordinate that is not free. MEASURED 2026-08-25: spo2 and
+# the three GCS components have k_high == 0 on every one of the 51,563 stays —
+# the measurement is bounded at its reference ceiling. alpha_high then sits at
+# the estimator floor and pi_plus = alpha_high / (n_obs + alpha_0), a strictly
+# monotone function of `n_obs` and nothing else. It separates no patients, so
+# entering it would re-admit measurement frequency under a physiology label —
+# the exact term excluded from every formula on transport grounds.
+#
+# Declared here rather than detected in R so R/05_formula.R stays data-free.
+
+# R/04_features.R's check_signal_tails() holds the declaration to the counts in
+# BOTH directions, as the validator does for `intervention_shape`.
+signal_tails:
+  spo2:       [low]
+  gcs_motor:  [low]
+  gcs_eyes:   [low]
+  gcs_verbal: [low]
+
+# ---------------------------------------------------------------------------
+# Signals that are NOT comparable across sites
+# ---------------------------------------------------------------------------
+# These signals are extracted at both sites, modelled at MIMIC, and reported in
+# the internal-validation results exactly like any other. They are dropped ONLY
+# from analyses that compare the two sites: external validation and the
+# attribution transport arm.
+#
+# This is a REPORTING exclusion, not an extraction or modelling one. The eICU
+# extraction still emits the column, so `signal` keeps all 19 factor levels at
+# both sites and validator checks 2 and 9 still pass. Dropping the signal from
+# the extraction would fail those checks and would be the wrong fix anyway: the
+# measurement exists at eICU, it just does not mean the same thing there.
+#
+# gcs_verbal, added 2026-08-29. MIMIC records `gcs_unable`, a clinician's
+# statement that verbal could not be assessed, and drops those timepoints. eICU
+# has no equivalent field, so intubated patients are scored 1 instead of being
+# marked unassessable. MEASURED (sql/eicu/audit_round_2, Q4/Q4b both sites):
+# among ventilated stays the share of measurements at the component floor is
+#
+#             MIMIC   eICU    ratio
+#   motor     19.9%    9.5%    0.48
+#   eyes      36.2%   21.5%    0.59
+#   verbal    13.0%   56.3%    4.33
+#
+# and among NON-ventilated stays the two sites agree almost exactly (motor 1.1%
+# vs 1.1%, eyes 2.8% vs 2.7%). Motor and eyes move in the opposite direction to
+# verbal, so this is not eICU sedating more deeply — it is the missing filter.
+#
+# Masking verbal during ventilation at both sites was considered and rejected:
+# 70% of MIMIC's post-filter ventilated verbal measurements score the maximum,
+# so clinicians do record meaningful verbal scores in ventilated patients, and
+# masking them would destroy real MIMIC data to conceal an eICU limitation.
+signals_not_transportable:
+  - gcs_verbal
+
+# Same idea, on the intervention side: an intervention whose EXPOSURE variable
+# is degenerate at eICU and therefore not comparable between sites. The
+# intervention is still extracted, still modelled, and still enters the layer-1
+# formulas at both sites -- nothing branches on site. What is excluded is the
+# CROSS-SITE ATTRIBUTION CLAIM for the signals this intervention is paired with.
+#
+# invasive_vent, added 2026-08-29. eICU's `respiratorycare` table does not encode
+# extubation: rows restate the ongoing episode at each review rather than
+# recording an episode's end, so the reconstructed exposure fraction is exactly
+# 1.0 for 90.5% of ventilated stays against MIMIC's 25.0%, with MIMIC's median
+# at 0.708. MEASURED alternatives, both rejected:
+#   * dropping rows with unusable end offsets collapsed prevalence from 32.2% to
+#     8.1% and pushed non-ventilated mortality from 4.7% to 8.6%, i.e. it
+#     destroyed ascertainment to buy a modest duration improvement;
+#   * taking duration from hourly PEEP charting (audit round 4, Q11) covers only
+#     73.3% of ventilated stays and gives a median of 6 hours against MIMIC's 17,
+#     so it under-counts by roughly as much as the current rule over-counts.
+# `invasive_vent` pairs with `spo2` and `resp_rate` in pairing.csv, so the
+# caveat attaches to the transport result for those two signals specifically.
+#
+# *** PENDING REVISION, 2026-09-04. DO NOT QUOTE THE 90.5% AGAIN WITHOUT
+# READING THIS. *** Audit round 6 rewrote the eICU ventilation duration
+# rule in `sql/eicu/v2_02b_interventions_eicu.sql`, and the declaration
+# above describes the OLD extraction. The stated ground for it was that
+# `exposure_frac` is exactly 1.0 for 90.5% of ventilated eICU stays, so a
+# smooth fitted across MIMIC's spread would be evaluated on a point mass.
+# That ground is answered: the rewritten rule takes the end from the last
+# minute of strict ventilator charting where it exists (73.9% of stays),
+# the last in-window respiratory care review where it does not (7.7%),
+# and onset-to-window-end only for the remainder (18.4%). Simulated, the
+# share at exactly 1.0 falls to 18.6% and the mean to 0.744, against
+# MIMIC's 25.0% and 0.661.
+#
+# WHAT REPLACES THE OLD GROUND IS WEAKER AND REPORTABLE: a measured +3.6
+# hour bias against 6,880 stays whose true extubation time is known, and
+# 18.4% of stays still holding an assigned upper bound. Whether this key
+# is DELETED or replaced by a stated limitation is a decision to take
+# after the re-extraction produces real numbers, not from the simulation.
+# The key stays in force until then. Full reasoning:
+# `docs/v2_audit_findings_20260903.md` sections 9.5, 9.6 and 9.8.
+interventions_exposure_not_transportable:
+  - invasive_vent
+
+# Interventions. TWO whitelists, because the extraction is deliberately wider
+# than the model ("extract wide, model narrow", v2_handoff.md:146).
+#
+#   interventions_extracted - the 18 present in the parquet. Validator check 2
+#                             tests membership against THIS set.
+#   interventions_modelled  - the 13 of spec §4 that may enter a formula.
+#                             Anything here but not in _extracted is an error.
+#
+# `inotrope`, `rrt` and `paralytic` are modelled-whitelisted but absent from
+# config/pairing.csv: rrt and paralytic are masking-only, and mbp's pair stays
+# `vasopressor` alone (spec §4).
+interventions_extracted:
+  - diuretic
+  - fio2
+  - inotrope
+  - insulin
+  - invasive_vent
+  - noninvasive_vent
+  - opioid
+  - paralytic
+  - peep
+  - rrt
+  - sedation_benzo
+  - sedation_dexmed
+  - sedation_propofol
+  - supplemental_o2
+  - transfusion_ffp
+  - transfusion_platelet
+  - transfusion_prbc
+  - vasopressor
+
+interventions_modelled:
+  - vasopressor
+  - inotrope
+  - invasive_vent
+  - fio2
+  - rrt
+  - sedation_benzo
+  - sedation_propofol
+  - sedation_dexmed
+  - insulin
+  - paralytic
+  - diuretic
+  - transfusion_prbc
+  - transfusion_platelet
+
+intervention_shapes: [state, event]
+
+# Static intervention -> shape map. Design information, not data: it lets
+# R/05_formula.R pick shape-appropriate terms without reading a parquet file.
+# The validator checks it against `intervention_features.shape` on every load.
+intervention_shape:
+  diuretic:             event
+  transfusion_ffp:      event
+  transfusion_platelet: event
+  transfusion_prbc:     event
+  fio2:                 state
+  inotrope:             state
+  insulin:              state
+  invasive_vent:        state
+  noninvasive_vent:     state
+  opioid:               state
+  paralytic:            state
+  peep:                 state
+  rrt:                  state
+  sedation_benzo:       state
+  sedation_dexmed:      state
+  sedation_propofol:    state
+  supplemental_o2:      state
+  vasopressor:          state
+
+# Which interventions carry molecule counts (spec §5.3, revised). NOT sedation_*.
+#
+# Contributes `n_agents` ONLY. `max_concurrent_agents` is extracted but no longer
+# modelled (2026-08-25): MEASURED on the training set, the two are equal on
+# 99.03% of stays and correlate at r = 0.9916, which drove observed concurvity to
+# 1.00 in every model carrying both. The 0.97% that differ are stays given two
+# pressors at different times but never concurrently -- a real clinical
+# distinction, and not one that ~400 stays can identify against a covariate this
+# collinear. The column stays in the parquet and in the validator CONTRACT.
+interventions_with_agent_counts: [vasopressor, inotrope]
+
+# ---------------------------------------------------------------------------
+# Magnitude parameterisation: quantile or extreme
+# ---------------------------------------------------------------------------
+# Which pair of level terms a signal carries beside `value_median`:
+#
+#   quantile  -> q05 / q95            the 5th and 95th percentile of hourly
+#                                     MEDIANS. Protected twice: once by the
+#                                     within-hour median, once by the quantile.
+#   extreme   -> value_min / value_max  MIN(hr_min) and MAX(hr_max), the raw
+#                                     extremes over the window.
+#
+# `excursion_side` still selects WHICH of the pair enters; this selects which
+# PAIR. The two questions are independent.
+#
+# WHY THIS IS NOT A FREE CHOICE, in both directions.
+#
+# For SPARSE signals the quantile is a fiction. MEASURED 2026-08-25: for every
+# sparse signal `q05` equals the minimum on 100.0% of training stays and `q95`
+# the maximum on 95.6-99.9%; median n_obs is 1-2. The fifth percentile of two
+# numbers IS the smaller one, and swapping them changes deviance explained by
+# 0.00000. Naming it a percentile in the methods would describe a statistic the
+# data cannot support. This is truth in labelling; it fixes no collinearity.
+#
+# For DENSE signals the extreme is dangerous, and the fit evidence points the
+# WRONG WAY: `med + value_min/max` beats `med + q05/q95` by 0.0072 deviance
+# explained on mbp and 0.0028 on spo2. Reject it anyway. `value_min` is
+# MIN(hr_min) -- the single most extreme raw reading in 24 hours -- and SQL step
+# 3b documents that one artifact sets the hourly minimum. A damped arterial line
+# reading MAP 35 clears the physiological bounds in 3a and lands straight in
+# `value_min`; line problems are commoner in unstable patients, so a more
+# artifact-exposed feature fitting better is not evidence it is a better one.
+#
+# GCS is why this cannot key on `signal_class` alone: the three components are
+# classed `dense` but are bounded integer scales of length 4-6, where `q05` and
+# `value_min` agreed on 99.6%+ of stays. Their reason is short range, not low
+# measurement density, and it lands in the same place.
+# Does `value_median` enter beside the extreme/quantile? FALSE as of 2026-08-27.
+#
+# MEASURED, 7 signals, with and without:
+#   COST      -0.00000 to -0.00231 deviance explained (2-4% relative). Largest
+#             on the dense signals, where the median is least redundant;
+#             exactly 0.00000 on lactate.
+#   GAIN      creatinine/meas bootstrap SD of the worst single term falls from
+#             0.5486 to 0.1617, and worst-term/total-eta from 8.66x to 2.59x.
+#             The DECOMPOSITION becomes estimable.
+#   NOT       gained: concurvity. It falls only 0.999 -> 0.982 (creatinine),
+#             0.994 -> 0.994 (mbp), and stays >= 0.94 everywhere. `value_max`
+#             and `pi_minus` remain near-deterministic in each other, because a
+#             value below the reference bound is what MAKES k_low non-zero.
+#             Do not describe this change as fixing concurvity; it fixes
+#             attributability, which is the thing that was actually broken.
+#
+# The remaining parameterisation is also the conventional one: how bad it got
+# (extreme), how much of the time (pi), and which way it was going (trend).
+# Worst-value-in-window is what SAPS-II, APACHE and SOFA all use.
+#
+# Set true to restore it; nothing else changes.
+level_terms_include_median: false
+
+# Does the MAGNITUDE term (q05/q95 or value_min/value_max) enter at all?
+#
+# Turning this off leaves each signal with propensity (pi) and trajectory
+# (trend) only: HOW OFTEN it was abnormal and WHICH WAY it was going, with no
+# statement of HOW FAR. Semantically magnitude and propensity are different
+# claims, which is why both were in the design -- but they concurve at 0.94+
+# everywhere, so it is worth knowing what magnitude actually buys once
+# propensity is already in the model.
+#
+# Both flags false is legal and gives the pure propensity+trajectory ablation.
+level_terms_include_extreme: true
+
+level_terms_by_class:
+  dense:  quantile
+  rate:   quantile
+  sparse: extreme
+
+# Per-signal overrides. Same role as `signal_tails`: the class default is right
+# almost everywhere and the exceptions are declared, never detected.
+level_terms_override:
+  gcs_motor:  extreme
+  gcs_eyes:   extreme
+  gcs_verbal: extreme
+
+# ---------------------------------------------------------------------------
+# Conditional-prior shrinkage (R/04b_conditional.R)
+# ---------------------------------------------------------------------------
+# Two constructs, one idea: pi_hat's estimator with a prior mean that depends on
+# a covariate instead of being a constant. Full reasoning in R/04b_conditional.R.
+#
+#   magnitude_conditional   the MAGNITUDE term becomes `{var}_delta` -- how far
+#                           past its bound the signal went, relative to what its
+#                           DEVIATION COUNT predicts. Replaces the raw q05 /
+#                           q95 / value_min / value_max term; it does not add
+#                           one, so the term count is unchanged.
+#   intensity_conditional   the second INTENSITY term becomes `{iv}__lambda` --
+#                           how hard the stay was treated, relative to what its
+#                           EXPOSURE DURATION predicts. Replaces `n_agents` for
+#                           state+agent interventions and `total_amount` for
+#                           event ones. The exposure term itself is unchanged.
+#
+# WHY. MEASURED 2026-08-28, MIMIC-IV training set:
+#
+#   magnitude   40-60% of the variance in the raw magnitude term is predictable
+#               from (k, n_obs) alone -- creatinine 0.512, mbp 0.604, bun 0.559,
+#               lactate 0.478, temperature 0.401. That part is order-statistic
+#               arithmetic (more deviant hours reach further into the tail), not
+#               physiology, and it is exactly what pi_hat already carries.
+#               r(magnitude, pi) falls from 0.62-0.77 to under 0.045, and
+#               deviance explained RISES on all five signals tested.
+#   intensity   the dose-duration exponent ranges from 0.004 (inotrope) to
+#               1.686 (diuretic) across the five (D, A) pairs, so no fixed
+#               transform is right for more than one of them. r(A, D) falls from
+#               0.40-0.86 to under 0.05; at most 1.1% of the variance in
+#               log lambda is recoverable by any smooth function of exposure.
+#
+# BOTH ARE BIJECTIONS given frozen parameters, so neither removes information --
+# unlike `level_terms_include_median`, which deleted a covariate at a cost of
+# 0.001-0.002 deviance explained. Set either false to fall back to the raw term.
+#
+# NOT a concurvity fix, and must not be described as one. MEASURED: reported
+# concurvity barely moves, because mgcv's concurvity(full = FALSE) on this model
+# class is largely reading the point mass at zero -- on pure noise with no second
+# covariate it returns the zero-fraction itself, to three decimals.
+magnitude_conditional: true
+intensity_conditional: true
+
+# Per-signal overrides for the magnitude construct. Same role as
+# `level_terms_override`: the global default is right almost everywhere and the
+# exceptions are declared, never detected.
+#
+# OPEN DECISION, left visible rather than silently defaulted. The three GCS
+# components are bounded integer scales of length 4-6, so `delta` there is a
+# continuous residual of a 4-to-6-valued quantity -- well defined statistically,
+# but semantically much coarser than the same construct on creatinine, and NOT
+# yet measured. Set them false here if the measurement says it does not carry.
+magnitude_conditional_override: {}
+
+# Functional form of the `delta` conditional mean (R/04b_conditional.R).
+# DECLARED per signal, never detected: a form chosen by inspecting the response
+# would differ between sites and turn the transport result into an artifact.
+#
+#   linear    E[v | k, n] = a0 + a1 log(1+k) + a2 log(n), OLS, subtract.
+#             Right for a continuous magnitude.
+#   ordinal   proportional-odds cumulative link on the declared level set, with
+#             the residual as a deterministic mid-PIT on the logit scale.
+#             Right for a bounded ordinal one.
+#
+# ONLY THE THREE GLASGOW COMPONENTS ARE ORDINAL, and the reason is measured
+# rather than aesthetic. Under the linear form their `resid_smooth_r2` is
+# 0.527 / 0.485 / 0.399 (verbal / motor / eyes) against <= 0.082 for every other
+# (signal, variable) pair, because `value_min | k` is close to a two-point
+# mixture whose mixing weight moves with k and a straight line cannot represent
+# the step. The linear fit also predicts off-scale for 7.6% / 3.9% / 2.1% of
+# stays, so its residual is taken against an impossible Glasgow score.
+magnitude_form: linear
+magnitude_form_override:
+  gcs_motor:  ordinal
+  gcs_eyes:   ordinal
+  gcs_verbal: ordinal
+
+# The level set for every signal under the ordinal form. CONSTANTS OF THE SCALE,
+# not properties of this cohort: Glasgow motor is 1-6 by definition. Detecting
+# them would let the model differ between sites, and it demonstrably would --
+# eICU's gcs_verbal sits at its floor for 56.3% of ventilated measurements
+# against MIMIC's 13.0%. `check_ordinal_scales()` holds the declaration to the
+# observed values in both directions at every site.
+magnitude_ordinal_scale:
+  gcs_motor:  {min: 1, max: 6}
+  gcs_eyes:   {min: 1, max: 4}
+  gcs_verbal: {min: 1, max: 5}
+
+# Molecule pool size for the beta-binomial intensity model: how many distinct
+# molecules COULD have been used. DECLARED, never detected, for the same reason
+# as `smooth_k` and `signal_tails` -- the model is frozen from MIMIC rather than
+# re-derived at eICU (hard rule 8).
+#
+# Counts are from canonical_variable_spec.md SS7: vasopressor is norepinephrine,
+# epinephrine, phenylephrine, vasopressin, dopamine; inotrope is dobutamine and
+# milrinone. check_agent_pool() holds this to the observed counts, which is what
+# turns the SS7 drugname-vs-molecule trap at eICU into a loud failure rather
+# than a plausible-looking case-mix difference.
+intervention_agent_pool:
+  vasopressor: 5
+  inotrope:    2
+
+# ---------------------------------------------------------------------------
+# Which signal classes carry a `trend` term
+# ---------------------------------------------------------------------------
+# SQL rev 3 computes a slope for EVERY class where the guards allow it (extract
+# wide); this decides which of them reaches a formula (model narrow).
+#
+# MEASURED 2026-08-26, SQL audit 6 — mortality by `dx_trend_defined`, and the
+# reason sparse signals are excluded:
+#
+#   signal        undefined   mort(undef)  mort(def)   gap
+#   sodium            38%        0.058       0.130     +7.2 pp
+#   lactate           53%        0.094       0.184     +9.0 pp
+#   bilirubin_total   70%        0.141       0.217     +7.7 pp
+#   bun               32%        0.075       0.116     +4.0 pp
+#   creatinine        32%        0.083       0.112     +2.9 pp
+#   mbp / heart_rate  <0.1%          --          --     n/a
+#
+# `trend = 0` is assigned to BOTH "genuinely flat" and "not estimable". For a
+# sparse lab those two groups have sharply different mortality, so the point
+# mass at zero is a mixture and `s(trend)` at zero would estimate a blend of
+# physiology and "nobody repeated the test". That is missingness-as-evidence,
+# the exact v1 vulnerability this rebuild exists to remove (spec §5.5).
+#
+# For dense vitals the undefined group is 18-89 stays out of 51,000 — the
+# conflation exists but has nothing to condition on.
+#
+# RESIDUAL, and a stated limitation rather than a solved problem: glucose (12.5%
+# undefined, +3.3 pp) and the GCS triple (~10%, -4.8 pp) are `dense` and stay
+# in. GCS is the more interesting case — its undefined stays are largely those
+# whose hours were removed by the sedation/paralytic masking in SQL decision
+# table 2, so the mechanism is masking rather than charting, and the sign is
+# reversed (undefined stays are SICKER).
+trend_classes: [dense, rate]
+
+# ---------------------------------------------------------------------------
+# The interaction-term basis cap
+# ---------------------------------------------------------------------------
+# Per MARGIN of every `ti(measurement, intervention)` cross term the two
+# interaction models carry, capped and then floored at 3 against that margin's
+# own `smooth_k` entry -- so a cross term's basis can only ever be SMALLER than
+# the same variable's main-effect smooth, never larger.
+#
+# WHY 5, AND WHY IT IS DECLARED RATHER THAN SEARCHED. A tensor interaction over
+# two 10-dimensional margins is a 100-column block per cross term, and `mbp`
+# carries 16 of them; at k = 5 it is 25 columns and the saturated model stays
+# inside the same fitting budget as the additive one. It was 5 in every
+# instrument that measured these interactions before they entered the spec
+# (tests/coupling_interaction.R, coupling_oof.R, coupling_score.R,
+# coupling_attribution.R) and it is 5 here, unchanged, so the 371 attribution
+# replicates already on disk describe THIS design. Tuning it against a fit
+# statistic would be choosing a basis after seeing which fits it flatters.
+#
+# IT LIVES HERE AND NOT IN config/attribution_eval.yml AS OF 2026-09-07. That
+# file's own header states the rule it has to obey -- nothing in it may change
+# what is fitted -- and the moment the interaction models entered LAYER1_MODELS,
+# `k_ti` decided the term set of 21 fitted specs. Leaving it there would have
+# been the F9-to-F11 pattern with the sign reversed: not a literal shadowing a
+# config key, but a config key in the file that promises not to matter.
+k_ti: 5
+
+# ---------------------------------------------------------------------------
+# Per-covariate basis dimension
+# ---------------------------------------------------------------------------
+# `bam.k` below is the default (10). This block names every smooth covariate
+# that cannot carry it, because a thin-plate basis needs k <= the number of
+# distinct covariate values and mgcv errors outright when it does not:
+#
+#   "A term has fewer unique covariate combinations than specified maximum
+#    degrees of freedom"
+#
+# MEASURED on the MIMIC-IV training set, 2026-08-25: 13 of 116 distinct
+# (signal, smooth covariate) pairs fall at or below k = 10. Three causes, all
+# structural rather than accidental:
+#
+#   GCS components   the scales are integer and short -- eyes 1-4, verbal 1-5,
+#                    motor 1-6 -- so `value_median` and `q05` inherit exactly
+#                    that many values, and `trend` only a few more.
+#   agent counts     `n_agents` and `max_concurrent_agents` are counts of
+#                    concurrent vasopressor molecules: 6 distinct values.
+#   platelet n_hours transfusion is event-shaped and short-duration.
+#
+# Declared here, NEVER detected in R, for the same reason as `signal_tails` and
+# the old interaction map: R/05_formula.R stays data-free, and the basis is
+# frozen from MIMIC rather than re-derived at eICU, where charting granularity
+# differs (hard rule 8). A site whose counts contradict this fails loudly --
+# check_smooth_k() holds the declaration to the data in both directions, and
+# check_model_frame() re-checks every fitting subset, so a fold that thins a
+# covariate is caught before bam() sees it.
+#
+# Rule used: k = (distinct values on the THINNEST of the five fold fitting
+# subsets) - 1, not on full train. A fold holds 4/5 of the rows, and the fit
+# that has to succeed is the fold fit. Measuring on full train would set k one
+# too high wherever a fold thins a covariate — which happens exactly once here:
+# `transfusion_platelet__n_hours` has 10 distinct values on full train and 9 on
+# fold 3, so k = 9 fits four folds and dies on the fifth.
+#
+# The distinction is structural, not incidental. The GCS scales and the agent
+# counts are BOUNDED discrete scales: every level appears in every subset, so
+# their counts are identical on train and on all five folds. Count-valued
+# durations have thin upper tails and are not stable. Both numbers are recorded
+# below for that reason.
+#
+# The comment on each line is (train / thinnest fold), so a re-extraction that
+# changes either is visible in the diff.
+smooth_k:
+  # NOTE: the GCS `trend` overrides were REMOVED 2026-08-26. Under SQL rev 2
+  # trend was median(late half) - median(early half) on an integer scale, so it
+  # inherited that scale: 7 and 9 distinct values. Under rev 3 it is an OLS
+  # slope in points-per-24h and therefore CONTINUOUS -- 9,503 and 4,841 distinct
+  # values on the training set. The overrides were silently costing basis
+  # flexibility on a covariate that no longer needs one. `value_median` and
+  # `q05` are unaffected: those are still the raw integer scale.
+  # The GCS low tail is `value_min` rather than `q05` as of 2026-08-26 (see
+  # level_terms below). Same numbers -- they agreed on 99.6%+ of stays -- so
+  # the same k; only the key changes.
+  gcs_eyes:
+    value_median: 3        # 4 / 4    integer scale 1-4
+    value_min:    3        # 4 / 4
+  gcs_motor:
+    value_median: 5        # 6 / 6    integer scale 1-6
+    value_min:    5        # 6 / 6
+  gcs_verbal:
+    value_median: 4        # 5 / 5    integer scale 1-5
+    value_min:    4        # 5 / 5
+  mbp:
+    vasopressor__n_agents: 5    # 6 / 6   distinct molecule counts
+  heart_rate:
+    vasopressor__n_agents: 5    # 6 / 6
+  platelet:
+    # The one covariate whose count is NOT stable across folds: 10 on train,
+    # 9 on the thinnest fold. k = 8, from the fold, not from train.
+    transfusion_platelet__n_hours: 5         # 10 train / 8 thinnest fold
+
+# ---------------------------------------------------------------------------
+# bam settings
+# ---------------------------------------------------------------------------
+# mgcv::bam(). na.action is na.fail in every call, non-negotiable: mgcv's
+# default silently drops NA rows, which would delete every unexposed patient
+# from a peak_intensity smooth without warning (CLAUDE.md hard rule 3).
+# bs = "ts" penalises the null space too, so useless terms vanish entirely —
+# that is the term selection, hence select = false.
+bam:
+  family: binomial
+  method: fREML
+  discrete: true
+  nthreads: 4
+  na_action: na.fail
+  select: false
+  # gamma multiplies the effective degrees of freedom in mgcv's smoothness
+  # selection, so gamma > 1 selects smoother fits. Set to 1.5 on 2026-09-05
+  # because the default of 1 admits QUASI-COMPLETE SEPARATION: `gcs_motor/full`
+  # drove `s(value_min_delta)` to a contribution of 122 nats on held-out rows,
+  # with max|coef| 19.85 and five training rows at a fitted probability
+  # numerically 0 or 1, and the final model is in the live bundle and applies at
+  # eICU. MEASURED on gcs_motor fold 1: gamma = 1.5 takes max|eta| from 125.99
+  # to 5.63 and the 0/1 count from 3 to 0, for 0.34 percentage points of
+  # deviance explained. `select: true` does nothing here because bs = "ts"
+  # already carries the null-space shrinkage it would add, and method = "REML"
+  # only reduces the blowup to 105.81.
+  # 1.5 is Wood's standard anti-overfit value, taken as a declared default
+  # rather than searched for -- the smallest tested value was already
+  # sufficient, and tuning it against the symptom would be choosing a threshold
+  # after seeing which fits trip it.
+  gamma: 1.5
+  smooth_basis: ts
+  k: 10
+  gc_level: 0
+
+# ---------------------------------------------------------------------------
+# Metrics (R/09, apply-time only)
+# ---------------------------------------------------------------------------
+# n_bins  equal-COUNT bins for the risk-ordering curve. 20 is the spec value.
+#         At ~41,000 out-of-fold stays and a 10.3% event rate that is ~2,060
+#         stays and ~210 deaths per bin on average, but the bottom bins hold far
+#         fewer deaths than that -- which is why the curve carries Wilson
+#         intervals and why an inversion is only reported as real when two
+#         intervals fail to overlap.
+# n_boot  percentile bootstrap replicates for the AUROC/AUPRC intervals.
+metrics:
+  n_bins: 20
+  n_boot: 200
+
+# ---------------------------------------------------------------------------
+# XGBoost comparison arm (R/09b_xgboost.R)
+# ---------------------------------------------------------------------------
+# DECLARED, NEVER TUNED. Same discipline as the diagnostic thresholds: choosing
+# a baseline's hyperparameters after seeing its AUROC is how a comparison arm
+# becomes a foregone conclusion, in whichever direction the tuner was pointed.
+# These are ordinary, unremarkable settings for a ~50k-row binary problem with a
+# 10.3% event rate; if they are ever changed it must be before a run, and the
+# reason must be a property of the data rather than of the result.
+#
+# `nrounds` is the one quantity chosen FROM the data, by early stopping on an
+# inner split of the fitting folds. Never on the held-out fold -- that is the
+# same leak as tuning on test. AS OF 2026-09-09 (statistical review S2/S3) the
+# inner split is grouped by patient and stratified on mortality, and the
+# early-stopped fit decides ONLY the round count: a fresh booster is then
+# fitted on every offered row for that count (`XGB_FIT_PROTOCOL` in R/09b).
+# `valid_frac` is therefore the share of rows the round count is chosen on,
+# not a share withheld from the returned model.
+#
+# min_child_weight is set at 10 rather than the default 1 because the bottom
+# risk deciles hold few deaths and a tree that can isolate single events will
+# manufacture a monotonicity curve it cannot reproduce out of fold.
+xgboost:
+  max_depth: 4
+  eta: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  min_child_weight: 10
+  lambda: 1
+  nrounds_max: 2000
+  early_stopping_rounds: 50
+  valid_frac: 0.2
+  nthread: 4
+
+# ---------------------------------------------------------------------------
+# APACHE comparison arm (R/09c_apache.R, tests/metrics_severity.R)
+# ---------------------------------------------------------------------------
+# DECLARED BEFORE THE RUN, never chosen after seeing a result. Same discipline
+# as the xgboost block and the diagnostic thresholds: every one of these three
+# settings moves the baseline's strength, and picking them after reading an
+# AUROC is how a comparison arm becomes a foregone conclusion.
+#
+# min_vars_present
+#   How many of APACHE II's twelve physiologic variables a stay must have
+#   before it is counted as having an APACHE II score at all. Missing variables
+#   contribute zero points, which is the standard retrospective convention and
+#   which makes a thinly covered stay look HEALTHY rather than unmeasured. That
+#   bias runs against the baseline and therefore in favour of our arm, so the
+#   restricted analysis is the honest primary and the unrestricted one is
+#   reported beside it. 10 of 12 allows a stay to be missing an arterial gas
+#   and one lab, which is ordinary, while excluding stays with no chemistry at
+#   all.
+#
+# arf_doubling
+#   APACHE II doubles the creatinine points under acute renal failure. FALSE,
+#   because all three parts of the operational definition are unreliable in
+#   retrospective data: the 24h urine volume is summed over covered hours only
+#   and therefore under-states, `rrt` in the first 24 hours does not separate
+#   chronic dialysis from acute, and the original definition was applied
+#   prospectively by a clinician. Turning it on is a pre-run decision and the
+#   result must be reported as a sensitivity, not swapped for the primary.
+#
+# gcs_source
+#   THE LARGEST SINGLE LEVER IN THE ARM, ahead of arf_doubling and the coverage
+#   floors. MEASURED 2026-08-30 (audit A4): at MIMIC the native and
+#   reconstructed totals differ on 41.4% of stays with a mean gap of 3.80
+#   points, while eICU -- which masks nothing -- differs by 0.12. So the gap is
+#   the VERBAL CONVENTION, not hourly binning.
+#
+#   The direction matters and runs against the baseline. APACHE II's GCS term
+#   is 15 - GCS and SOFA's CNS band is on GCS directly, so a HIGHER GCS means
+#   FEWER points, a WEAKER baseline, and a result that flatters our method.
+#   `native` is the higher of the three by 3.8 points on two fifths of the
+#   cohort, so choosing it is choosing the weakest baseline. It is still the
+#   right primary -- it is the published convention and a baseline should be
+#   computed the way the score normally is -- but the other two must be
+#   REPORTED, not merely available.
+#
+#     native      each site's canonical total. PRIMARY.
+#     ours        our hourly components, verbal imputed 1. Pessimistic bound.
+#     ours_vnorm  the same, verbal imputed 5. Optimistic bound, and the
+#                 standard prospective convention.
+#
+#   The two `ours` variants BRACKET the baseline and the paper reports the
+#   bracket. A tuned middle constant was considered and rejected: fitting the
+#   sensitivity's constant until it agrees with the score it is a sensitivity
+#   AGAINST would leave it measuring nothing.
+# ---------------------------------------------------------------------------
+# The SYMMETRIC coverage restriction (R/10b_severity.R)
+# ---------------------------------------------------------------------------
+# `apache.min_vars_present` and `sofa.min_organs_present` restrict the
+# comparison to stays where the BASELINE is scoreable, on the stated ground
+# that a restricted baseline against an unrestricted proposed method is a
+# weaker experiment. That reasoning is symmetric and was applied in one
+# direction only: nothing required OUR inputs to be present.
+#
+# WHY IT MATTERS, MEASURED. At eICU, APACHE II reads its Glasgow score from a
+# native field present on 95.1% of stays while our signal-level extraction
+# reaches 58.8%, because roughly a third of eICU hospitals chart GCS in
+# `physicalexam` rather than `nursecharting`. So on about a third of stays the
+# baseline gets a Glasgow score and our three Glasgow signals get L = 0 by
+# assignment. At MIMIC both paths cover essentially everyone, so the asymmetry
+# does not exist there and the comparison is clean. Reporting only the
+# baseline-restricted cell understates the method at eICU for a reason that is
+# an extraction gap rather than a transport finding.
+#
+# NEITHER CELL IS PRIMARY ON ITS OWN AND BOTH ARE ALWAYS REPORTED. The
+# symmetric restriction is not free either: requiring our inputs selects the
+# GCS-charting hospitals and is therefore hospital-confounded. The two bracket
+# the truth in opposite directions, which is the same treatment
+# `min_organs_present` already gets.
+#
+# DECLARED BEFORE THE RUN, never chosen after seeing which cut helps. Both
+# knobs are frozen into the bundle so an apply site cannot pick different ones.
+#
+# require_signals
+#   Signals that must be measured for a stay to enter the symmetric cell.
+#   MOTOR AND EYES ONLY, AND VERBAL IS DELIBERATELY EXCLUDED. Measured
+#   2026-09-03 on the signal-level extraction:
+#
+#                  motor    eyes   verbal   motor+eyes   all three
+#     MIMIC train  0.8936  0.8940  0.8130     0.8935      0.8127
+#     eICU         0.5880  0.5881  0.5857     0.5878      0.5853
+#
+#   Motor and eyes carry the whole asymmetry -- 30 points -- while verbal adds
+#   nothing to it at eICU and costs MIMIC 8 points. Those 8 points are MIMIC's
+#   `gcs_unable` filter removing verbal readings a clinician documented as
+#   unassessable, which is MIMIC doing something RIGHT that eICU structurally
+#   cannot do. Requiring verbal would penalise the better-handled site for
+#   handling it better. It is also already excluded from every cross-site
+#   analysis (`signals_not_transportable`, and docs/eicu_extraction.md 3.11),
+#   so requiring it here would contradict a frozen decision.
+#
+# min_signals_measured
+#   A floor on how many of the 19 signals contributed real evidence rather than
+#   an assigned zero. 0 disables it. Kept separate from `require_signals` so the
+#   named-signal rule and the count rule can be read apart.
+severity_symmetric:
+  enabled: true
+  require_signals: [gcs_motor, gcs_eyes]
+  min_signals_measured: 0
+
+apache:
+  min_vars_present: 10
+  arf_doubling: false
+  gcs_source: native
+
+# ---------------------------------------------------------------------------
+# SOFA comparison arm (R/09d_sofa.R, tests/metrics_severity.R)
+# ---------------------------------------------------------------------------
+# Same discipline as the apache block: declared before the run, never chosen
+# after seeing a result.
+#
+# min_organs_present
+#   How many of SOFA's six organs a stay must have before it counts as having a
+#   SOFA at all. A missing organ scores zero, which reads as a healthy organ
+#   rather than an unmeasured one, so the bias runs against the baseline and
+#   therefore in favour of our arm — the same asymmetry the APACHE block
+#   documents.
+#
+#   MEASURED 2026-08-31: at MIMIC, 23,829 of 51,563 stays (46.2%) have >= 5
+#   organs but 50,481 (97.9%) have >= 4. The cliff between 4 and 5 is the
+#   bilirubin/arterial-gas pair -- bilirubin is ordered on 43% of stays and an
+#   ABG on 48%. So the first draft's value of 5 would have DROPPED 54% OF THE
+#   COHORT, and since the restriction is applied to every cell including
+#   `llr_sum`, the whole comparison would have run on a systematically
+#   better-monitored and therefore sicker subpopulation. That selection effect
+#   contaminates our own arm as much as the baseline and is far worse than the
+#   bias it was meant to fix.
+#
+#   4 keeps 97.9% of the cohort, so there is no meaningful selection, and it
+#   still excludes stays scored on three organs or fewer. The residual bias --
+#   about half of stays scoring 0 on respiration and 57% on liver -- is uniform,
+#   documentable, and is SOFA's own published convention in retrospective use.
+#   Report the unrestricted numbers beside it; the two bracket the truth in
+#   opposite directions and neither is primary on its own.
+#
+# resp_support
+#   Which ventilation counts towards SOFA's respiration tiers 3 and 4. Vincent
+#   1996 says mechanical ventilation; mimic-code's reference implementation
+#   counts non-invasive support too. Both flags are extracted, so this is a
+#   real choice rather than a guess — SET IT FROM SQL AUDIT A10, which
+#   cross-tabulates native respiration scores against each flag and shows which
+#   definition the derived concept actually used. DECIDED 2026-08-31 BY AUDIT A10, which is what it was built for. At native
+#   respiration tiers 3 and 4, `frac_inv` is exactly 1.000 on all 10,197 such
+#   stays -- every patient the derived concept scored 3 or 4 is INVASIVELY
+#   ventilated. Had the concept counted non-invasive support, some tier-3
+#   patients would be NIV-only and `frac_inv` would have fallen below 1. It did
+#   not. So the concept gates on invasive ventilation and this is `invasive`.
+#   The first draft's `any` was a guess and it was wrong.
+#
+# There is deliberately NO agent-tier setting. SOFA's cardiovascular bands are
+# agent-specific and `dx_nee_peak` is a norepinephrine equivalent, so the agent
+# distinction is collapsed and cannot be configured back. The consequence is
+# documented in .sofa_cardio() and sized by SQL audit A11; it is a stated
+# deviation from the published definition, not a tunable.
+# organs
+#   Which organs enter the RECOMPUTED total. Every organ is still computed and
+#   reported; this governs the score only, so an excluded organ stays visible
+#   as a diagnostic instead of vanishing.
+#
+#   RESPIRATION IS EXCLUDED, decided 2026-08-31 on measurement.
+#   `mimiciv_derived.bg.fio2` is NULL on 93% of stays, so a P/F ratio is
+#   computable on 12.3% of the cohort against 48.1% coverage for PaO2 alone.
+#   Of the stays where we scored 0 and the derived concept scored something,
+#   96% were missing the input entirely rather than computing a ratio above
+#   400. eICU is thinner still at 26.4% arterial gas coverage.
+#
+#   THE SCORING LOGIC IS NOT AT FAULT, which is why this is an exclusion and
+#   not a bug fix. Restricted to stays where the input exists, respiration
+#   agrees with the derived concept at 0.507 exact and Spearman 0.665, and our
+#   median P/F falls monotonically from 341 at native tier 0 to 130 at tier 4.
+#
+#   Dropping it moves the recomputed total from Spearman 0.875 / 58.0% exact to
+#   0.956 / 79.7% -- from a score that fails its own validation gate to one that
+#   passes it. The NATIVE six-organ SOFA is unaffected and stays the MIMIC
+#   within-site comparator; only the score that TRAVELS drops to five.
+#
+#   Restoring it needs FiO2 built from chartevents 223835 plus ventilator
+#   settings, carried forward and joined to each arterial gas, with an eICU
+#   analogue. Deferred, not abandoned. Add `respiration` back here to re-enable.
+sofa:
+  min_organs_present: 4
+  resp_support: invasive
+  organs: [coagulation, liver, cardiovascular, cns, renal]
+
+# ---------------------------------------------------------------------------
+# Diagnostic thresholds
+# ---------------------------------------------------------------------------
+# Fixed BEFORE fitting, never chosen after seeing which models trip them
+# (CLAUDE.md, frozen decisions). R/08_diagnostics.R emits one row per model;
+# only rows tripping a threshold reach triage.csv and get diagnostic plots.
+# With 19 signals x up to 3 models x (5 folds + 1 final) there is no other way
+# to review this by eye.
+diagnostics:
+  k_index_min: 0.90        # mgcv::k.check - basis dimension too low
+  k_index_p_max: 0.05      # ... and significantly so
+  edf_ratio_max: 0.80      # edf / (k - 1); near 1 means k is binding
+  concurvity_max: 0.80     # worst-case, mgcv::concurvity(full = FALSE)
+  dev_expl_min: 0.005      # a model explaining nothing is a plumbing bug
+  require_convergence: true
+
+  # THE DECOUPLING SMOOTH. Declared here from 2026-09-03 (audit finding F11);
+  # until then `bs = "ts"` and `k = 6` were written into R/04c_prior_diagnostics.R
+  # and into tests/conditional_review.R, and appeared in no config.
+  #
+  # It is declared because a number it produces is LOAD-BEARING. The frozen
+  # decision to keep `delta` on for the three GCS components (CLAUDE.md) rests
+  # on the measured smooth R-squared, "0.286-0.363 against <= 0.11 elsewhere".
+  # A basis dimension that a frozen decision rests on belongs where the other
+  # bases are declared, not where only a text search finds it — and since it is
+  # a smooth of a residual on log1p(k), a different `k` would give a different
+  # R-squared and could move that decision.
+  #
+  #   basis  thin-plate shrinkage, matching `bam.smooth_basis`. The shrinkage
+  #          variant matters here: the null case is "no leftover count
+  #          dependence", and `ts` can shrink the term to zero rather than
+  #          being forced to spend edf on noise.
+  #   k      R/04c's fixed basis for `resid_smooth_r2` / `resid_step_r2`. Small
+  #          on purpose: the question is whether ANY smooth curvature in the
+  #          residual survives, not what shape it has, and a large basis would
+  #          chase noise in the k > 0 subset where the Glasgow misspecification
+  #          shows up.
+  #   k_max  the cap for tests/conditional_review.R section D, which then
+  #          reduces further to the covariate's distinct-value count. That
+  #          diagnostic runs over exposure columns that are small counts, so it
+  #          cannot use a fixed basis (same constraint as config/smooth_k).
+  decoupling_smooth:
+    basis: ts
+    k: 6
+    k_max: 10
+

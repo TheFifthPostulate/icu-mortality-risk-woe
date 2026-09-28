@@ -1,0 +1,609 @@
+# config/attribution_eval.yml -------------------------------------------------
+# THE ATTRIBUTION-REPRODUCIBILITY PLAN.
+#
+# Read `docs/attribution_analysis_plan_20260906.md` section 10, then PART FOUR
+# (section 25 onward), which records the 2026-09-06 redesign this file now
+# declares. It configures two scripts and nothing else:
+# `tests/attr_replicates.R` (the expensive generator) and `tests/attr_metrics.R`
+# (the cheap consumer).
+#
+# WHY THIS FILE EXISTS RATHER THAN A BLOCK IN config/config.yml. Nothing here
+# changes what the pipeline fits. Adding these keys to `config/config.yml` would
+# change the `cfg` target's value and rebuild all 258 GAMs to produce identical
+# numbers -- the same argument `config/attribution.yml` and `config/external.yml`
+# make in their own headers.
+#
+# WHY EVERY THRESHOLD AND EVERY PATH IS HERE AND NOT BESIDE ITS CALL SITE.
+# Audit findings F9 to F11: a setting written down twice -- once in config and
+# once as a `%||%` fallback or a script literal -- can be edited apart, and the
+# divergence stays invisible until the key is deleted or misspelled. Both
+# scripts read every key below through `cfg_req()`, which has no fallback.
+#
+# ---- WHAT CHANGED ON 2026-09-06, AND WHY IT IS NOT A TWEAK ------------------
+#
+# The first version of this plan reported ONE NUMBER PER LEVEL, computed from
+# replicate 1 against replicate 2, and generated 778 further pairs that were
+# thrown away. That is not a shortcut, it is a different claim: a single
+# disagreement number cannot say how wide the disagreement gets, what the worst
+# observed case is, or whether the distribution is skewed, and a reproducibility
+# claim is exactly a statement about those three things. Every level is now
+# reported as a DISTRIBUTION through `attr_stat_summary()` -- min, p05, p10, q1,
+# median, mean, q3, p90, p95, max, IQR, sd and two skew indicators.
+#
+# Three further structural changes follow from it and are declared below.
+#
+#   THE BOOTSTRAP IS SHARED ACROSS METHODS (`bootstrap:`). Until 2026-09-06
+#   SHAP used `bag_of(seed_base + i)` and the LLR bootstrap used
+#   `bag_of(seed_base + 90000 + i)`, so SHAP replicate 3 and LLR replicate 3
+#   were fitted on DIFFERENT resamples and nothing could be paired. One bag per
+#   `boot_id`, fed to every method, makes the experiment BLOCKED: a level-4
+#   comparison holds the sample fixed and becomes a distribution over bags, and
+#   a cross-method level-3 comparison can be paired bag-pair by bag-pair.
+#
+#   LEVEL 2 IS PROPAGATED INTO LEVEL 3 BY DESIGN (`levels.seed.b_per_bag`).
+#   Not by a parametric variance-components model. Each bag additionally carries
+#   a re-seeded SHAP fit, so the same replicate store yields seed noise alone
+#   (L2), sampling noise alone (L3), and the operational quantity in which both
+#   move together (L3T). Two extra coordinates on a manifest, no new statistics.
+#
+#   THE LEVEL-4-OVER-LEVEL-3 RATIO IS DEMOTED (`selection:`). It is still
+#   computed and still reported; it decides nothing. The reasoning is in
+#   `attr_selection_score()`'s header and is summarised at the `selection:`
+#   block below.
+#
+# YAML 1.1 WARNING, WHICH THIS PROJECT HAS ALREADY BEEN BITTEN BY. `yaml::read_yaml()`
+# reads the bare words `y`, `n`, `yes`, `no`, `on`, `off`, `true` and `false` as
+# BOOLEANS -- in key position as well as in value position. `n: 50` declares a
+# key called FALSE, not one called `n`, and `cfg$n` then returns NULL forever
+# (finding F18, in `config/attribution.yml`). Every count key below is therefore
+# spelled `b`, `b_*` or `n_*` and never `n`. `tests/audit_b_config.R` check B5
+# scans every file in `config/` for the mangled names.
+# ----------------------------------------------------------------------------
+
+# --- what is being compared --------------------------------------------------
+#
+# The method list of plan section 10.1, plus the two `full_ti_*` arms. Those two
+# are FREE: the generator has to build `full_ti_trend` and `full_ti_all` anyway
+# in order to derive `cond_ti_trend` and `cond_ti_all` by subtracting `intv`, so
+# scoring them costs one extra pass over already-materialised matrices. They are
+# worth having because the `full` and `cond` spaces answer different questions
+# and the paper reports both: `full` is what `llr_sum` decomposes into, `cond`
+# is what an attribution CLAIM is about.
+#
+# `llr_intv` is generated and NOT scored as an attribution method. It exists
+# because `cond = full - intv`, so it must be materialised; but a pure
+# treatment-propensity contrast is not a per-signal explanation of a patient's
+# physiology and reporting its stability beside the others would invite reading
+# it as one.
+methods:
+  - llr_meas
+  - llr_full
+  - llr_cond
+  - llr_full_ti_trend
+  - llr_full_ti_all
+  - llr_cond_ti_trend
+  - llr_cond_ti_all
+  - shap_xgb_feat
+
+# `shap_xgb_raw` is DEFERRED, not forgotten. Its columns carry `n_obs` and a
+# missingness channel that map onto the 19 signals only loosely, so its groups
+# are not commensurable with the L matrix's. Add it here when a defensible
+# column-to-signal map exists for it.
+#
+# `xgb_feat` DOES NOT HAVE AN EXACT ROLLUP EITHER, and this line said otherwise
+# until 2026-09-07. Its 99 columns are 31 groups -- 19 signals and 12
+# interventions -- but `shap_oof()` in `tests/attr_replicates.R` keeps only the
+# 19 signal groups and DROPS the 12 intervention groups' contributions, which
+# is 10.1% of the |SHAP| mass and breaks TreeSHAP's additivity by a median of
+# 0.293 nats. That is a deliberate, defensible truncation -- what remains is
+# structurally the `llr_cond` analogue, measurement conditional on the
+# intervention features already being in the model -- but it is a judgement
+# call, not an exact partition, and it was found by review rather than by
+# design. Measured to change the level-3 stability comparison by at most 0.015
+# (against a SHAP-vs-LLR gap of 0.085 to 0.13) but to change which signal is
+# named as a patient's top contributor 8.8% of the time. See
+# `docs/attribution_analysis_plan_20260906.md` section 41 and the header of
+# `shap_oof()` in `tests/attr_replicates.R`.
+#
+# THIS IS AN ENFORCED LIST, NOT A NOTE. `tests/attr_replicates.R` refuses to run
+# if any name below also appears in `methods`, so "deferred" cannot quietly
+# become "enabled" by an edit in one place. Audit B reported this key dead on
+# 2026-09-06 when it was documentation only, and it was right to.
+deferred_methods:
+  - shap_xgb_raw
+
+# --- the design parameters the generator must not invent ---------------------
+#
+# `k_ti` IS NO LONGER DECLARED HERE. It moved to config/config.yml on
+# 2026-09-07, when `full_ti_trend` and `full_ti_all` entered LAYER1_MODELS
+# and the cross terms became something the pipeline FITS. This file's
+# header states the rule that forced the move: no key in it may change what
+# is fitted, and `k_ti` now decides the term set of 21 fitted specs.
+#
+# `interaction_terms()` in R/05_formula.R reads it through `cfg_req(cfg,
+# "k_ti")`, with no fallback, and `attr_design_key()` still takes it as an
+# argument so a stored ladder can be keyed to the value it was built under.
+# The VALUE is unchanged at 5, deliberately, so every replicate on disk
+# describes the design now in the pipeline.
+
+# --- the pinned reference runs, which were script literals until 2026-09-06 ---
+#
+# THESE ARE PINNED, NOT RESOLVED, AND THAT IS THE POINT. `latest_run()` would
+# make the gate follow whatever ran most recently, which is a comparison of the
+# library with itself rather than with a reference. Moving them out of the
+# script changes nothing about that; it makes them declarable, diffable and
+# checkable, which a literal buried at line 54 of a 675-line script was not.
+gate:
+  # THE GATE READS PRE-GAMMA RUNS ON PURPOSE and no number it prints is a
+  # current result. `coupattr_20260905T184528` was built before `bam.gamma`
+  # became 1.5, so its L arms belong to the previous pipeline -- which is
+  # exactly what makes it the right input: the gate is a statement about CODE
+  # EQUIVALENCE and needs the inputs the old code actually ran on.
+  ladder: out/runs/coupattr_20260905T184528
+  ties: out/runs/attrties_20260905T192331
+  floor: out/runs/shapfloor_20260906T000141
+
+  # THE STALENESS GUARD ON A PINNED REFERENCE, and it is a different guard from
+  # the ladder's. A design key asks "was this built by the current code?" and
+  # the answer here is deliberately NO. What must be checked instead is that the
+  # reference itself has not moved: these three hashes are `digest::digest()` of
+  # the md5 sums of every `.rds` under each run's `diagnostics/` and `tables/`,
+  # in sorted order. If a legacy run is regenerated, edited, or a table is added
+  # to it, the gate stops and says which run moved instead of silently comparing
+  # the library against a different reference. Recorded 2026-09-06.
+  content_keys:
+    ladder: f4d05b675b8b
+    ties: 6a3948fe5a0c
+    floor: 35d9f31e0bfa
+
+# --- the ladder the generator reuses instead of refitting --------------------
+#
+# The two interaction arms cost about six minutes to fit and are the only part
+# of level `spec` that is not a targets read. A `coupattr` run whose
+# `design_key` matches the live design was built by the same code on the same
+# design, so refitting it would burn six minutes to reproduce it bitwise.
+# `--ladder` on the command line still overrides this; the key exists so the
+# default is declared rather than remembered.
+#
+# GUARDED, NOT TRUSTED. `attr_design_diff()` compares the ladder's stamped
+# design key against the live one and STOPS on any differing field. Set to the
+# empty string to force a refit.
+ladder:
+  run: ""
+
+# --- THE SHARED BOOTSTRAP MANIFEST -------------------------------------------
+#
+# ONE BAG PER `boot_id`, FED TO EVERY METHOD. `bag_of(seed_base + b)` defines
+# bag b and every method that resamples uses exactly that bag for `boot_id = b`.
+#
+# WHAT IT BUYS, and neither is available without it:
+#   a LEVEL-4 DISTRIBUTION. Fit specification A and specification B on the SAME
+#     bag b and the comparison is paired -- the variation caused by which
+#     patients happened to enter bag b is shared by both and differences out.
+#     Across bags that gives {D(A_b, B_b)}, a distribution, where before there
+#     was one number from the two original fits.
+#   a PAIRED CROSS-METHOD LEVEL-3 COMPARISON. For the same pair of bags (b, b'),
+#     SHAP's sampling disagreement and an LLR arm's sampling disagreement are
+#     measured on identical resamples, so `attr_paired_delta()` can difference
+#     them bag-pair by bag-pair instead of comparing two marginal distributions.
+#     This is the strongest comparison in the arm and it is the one the paper
+#     wants: not "does LLR agree with SHAP", which there is every reason it
+#     should not, but "under identical training-sample perturbations, whose
+#     patient-level explanation moves less".
+#
+# `seed_base` IS UNCHANGED FROM THE VALUE THE 40 SHAP BOOTSTRAP REPLICATES ON
+# DISK WERE GENERATED UNDER, deliberately: bag b is the same bag it always was,
+# so those replicates remain valid and are skipped on the next generator run.
+# The LLR bootstrap replicates are NOT preserved -- they were on bags
+# `seed_base + 90000 + i`, which are different bags, and a replicate on a
+# different bag is a different replicate however convenient it would be to keep.
+bootstrap:
+  # Shared bags, ids 1..b. 40 gives 780 level-3 pairs per method and 40 paired
+  # level-4 observations per method pair. THE COST IS DOMINATED BY THE LLR
+  # BOOTSTRAP REFITS at `levels.sample.llr_bootstrap_b` below, not by this key.
+  b: 40
+  seed_base: 20260906
+
+# --- the reproducibility hierarchy -------------------------------------------
+#
+# SIX CONTRASTS, DERIVED FROM WHICH COORDINATE DIFFERS, by
+# `attr_pair_contrast()` in `R/14_attribution_eval.R` and nowhere else. A
+# replicate carries `(method, boot_id, seed_id, draw_id)`; the contrast is a
+# property of the PAIR.
+#
+#   L1   nothing differs                 the nats budget, which sets every scale
+#   L2   seed_id                         algorithmic noise
+#   L3   boot_id                         sampling noise, seed held
+#   L3T  boot_id AND seed_id             operational reproducibility -- level 2
+#                                        propagated into level 3, empirically
+#   L3P  draw_id                         posterior estimation noise, sample held
+#   L4   method, everything else held    specification
+#
+# LEVEL 2 IS EXACTLY ZERO FOR EVERY LLR ARM AND THAT IS A RESULT, NOT A GAP.
+# `bam` with fREML is deterministic at fixed settings -- audit finding F9
+# recorded a bitwise-identical refit -- and the only stochastic element in the
+# GAM path is fold assignment, which is seeded and frozen. `attr_replicate_plan()`
+# emits a `route: none` row for those rather than silently omitting them, so the
+# zero is visible in the plan table. It also means L3T = L3 for the LLR arms by
+# construction, and only SHAP has the two apart.
+#
+# `spec:` HAS NO BLOCK HERE, and its absence is deliberate. Level `spec` has
+# exactly one replicate per method by construction -- the arm as fitted -- so a
+# `b:` for it would be a settable number that means nothing, and setting it to 2
+# would declare a second copy of an identical matrix. Audit B reported the block
+# dead on 2026-09-06 when it existed. `attr_replicate_plan()` emits the level
+# unconditionally at index 1.
+levels:
+
+  seed:
+    # SHAP only. Seeds 1..b at `boot_id = 0`, the original training sample.
+    # 10 boosters cost 1.4 minutes in `shapfloor_20260906T000141`, so 8
+    # replicates is 40 boosters and about 6 minutes. C(8,2) = 28 level-2 pairs
+    # at the original sample, which is enough for a p95.
+    b: 8
+
+    # ADDED 2026-09-06: THE LEVEL-2-INTO-LEVEL-3 PROPAGATION, and the whole of
+    # it. Additional re-seeded SHAP fits at EACH bag `boot_id >= 1`, beyond the
+    # `seed_id = 0` fit that bag already gets. With this at 1, every bag carries
+    # two seeds, and the same store then yields all three quantities:
+    #
+    #   L2 conditional on a bag    (b, 0) against (b, 1)          -- 40 pairs
+    #   L3 pure, seed held         (b, s) against (b', s)         -- 780 x 2
+    #   L3T total                  (b, 0) against (b', 1)         -- 1,560
+    #
+    # WHY THIS AND NOT A BAYESIAN VARIANCE-COMPONENTS MODEL. A hierarchical
+    # Bernoulli model over pairwise disagreement indicators would need careful
+    # treatment of the dependence pairwise comparisons induce, and it would be a
+    # model used to rescue an ambiguous design. A nested design measures all
+    # three directly. If a variance decomposition is wanted later it becomes a
+    # second-stage summary of a good experiment rather than a substitute for
+    # one.
+    #
+    # THE COST IS `bootstrap.b` x THIS, in SHAP fits: 40 boosters, about 28
+    # minutes. It is the cheapest structural improvement in this file.
+    b_per_bag: 1
+
+    # Added to `cfg$seed + fold` for seed replicate s as `seed_base * s`.
+    # Declared so a regenerated replicate is the same replicate.
+    seed_base: 1000
+
+  sample:
+    # POSTERIOR DRAWS for the LLR arms, at `boot_id = 0`. These are contrast
+    # L3P and NOT L3: they condition on the observed sample and propagate
+    # ESTIMATION uncertainty, where a bootstrap resamples and propagates
+    # SAMPLING uncertainty. Measured 2026-09-06 at 1.17 to 1.57 times the
+    # bootstrap's spread, so the two must never be pooled -- the consumer
+    # groups by route for exactly this reason.
+    b: 40
+
+    # DECISION ON PLAN SECTION 10.3, TAKEN 2026-09-06. Option 1: regenerate the
+    # out-of-fold fits ONCE, keep `beta` and the smoothness-corrected covariance
+    # `Vc` per (signal, model, fold), and draw coefficient vectors from
+    # N(beta, Vc). Every subsequent replicate is then matrix algebra: the
+    # 320-fit basis pass cost under ten minutes against roughly seven and a half
+    # for ONE bootstrap replicate.
+    #
+    # HARD RULE 6 IS NOT BREACHED AND DID NOT NEED TO BE RELAXED. The rule
+    # forbids a FOLD FIT'S GAM OBJECT being kept -- `fit_one()` returns
+    # predictions and diagnostics and never the model. What the generator keeps
+    # is a fixed-size numeric summary (`beta`, `Vc`) consumed inside the same
+    # loop iteration; what reaches disk is an L matrix, which is what
+    # `l_oof.rds` already is. It enters no target and no bundle.
+    llr_route: posterior
+
+    # GENUINE LLR BOOTSTRAP REFITS ON THE SHARED BAGS 1..b. This was
+    # `validation_bootstrap_b: 5` and it was a validation of the posterior
+    # route. IT IS NOW THE PRIMARY LEVEL-3 QUANTITY FOR THE LLR ARMS, for two
+    # reasons found by running the small version:
+    #
+    #   THE POSTERIOR ROUTE IS THE WIDER ONE, not the narrower one as predicted
+    #   (plan 21.1). Every layer-1 smooth is `bs = "ts"` under `gamma = 1.5`, so
+    #   `Vc` describes how far the coefficients COULD be while a bootstrap
+    #   describes how far the PENALISED PROCEDURE actually moves, and under
+    #   heavy shrinkage the second is smaller. The question level 3 asks is the
+    #   bootstrap's.
+    #
+    #   ONLY THE BOOTSTRAP ROUTE GIVES A PAIRED LEVEL 4. Posterior draw i of arm
+    #   A and draw i of arm B share no resample and no basis -- their
+    #   coefficient vectors are not even the same length -- so pairing them by
+    #   index would be fictitious. `attr_pair_contrast()` refuses it.
+    #
+    # THE COST, STATED PLAINLY. One bootstrap iteration refits all five base
+    # arms across 19 signals and 5 folds and measured about 7.4 minutes on a
+    # 63% bag. At 40 that is ROUGHLY FIVE HOURS, and it is the single largest
+    # item in this file. The generator is content-addressed and resumable, so
+    # it can be run in pieces and interrupted safely. To halve it, set this to
+    # 20: level 3 then rests on C(20,2) = 190 pairs, which is still ample, and
+    # level 4 on 20 paired observations, which makes a p95 the second-largest
+    # value and is the point at which the tail statistic gets thin.
+    llr_bootstrap_b: 40
+
+    # THERE IS NO `resample_group` KEY HERE, AND THERE MUST NOT BE. Resampling
+    # is by patient, for the same reason the CV folds are grouped by patient: a
+    # stay-level resample splits a patient's repeat admissions across the in-bag
+    # and out-of-bag sets and leaks. But the grouping column is already declared
+    # ONCE, as `fold_group_by` in `config/config.yml`, and `bag_of()` resolves it
+    # through `resample_cols()` -- the one function R/03_folds.R allows to decide
+    # it. A key here would be a SECOND DECLARATION of the same thing, editable
+    # apart from the first, with nothing holding the two together: exactly the
+    # defect class of audit findings F9 to F11. One existed until 2026-09-06,
+    # was read by nothing, and audit B found it the same afternoon.
+    #
+    # THERE IS ALSO NO `seed_base` HERE ANY MORE. It used to seed both the bags
+    # and the posterior draws, which meant one key controlled two unrelated
+    # random streams. The bags moved to `bootstrap.seed_base` above; the draws
+    # use `draw_seed_base` below. Same value on purpose, so no replicate on disk
+    # changes, but they are now separately settable.
+    draw_seed_base: 20260906
+
+# --- the tie and sign tolerances ---------------------------------------------
+#
+# THE POLICY, IN ONE SENTENCE: report every agreement metric three ways, because
+# the three answer different questions and all three belong in the paper.
+#
+#   at delta = 0                  strict, and comparable with every number
+#                                 reported before this policy existed
+#   at delta_noise(method)        is this disagreement bigger than the method's
+#                                 own estimation noise?
+#   at a common absolute delta    do the two agree in absolute evidence terms?
+#
+# THE HAZARD, STATED SO IT CANNOT BE FORGOTTEN: a noisier method earns a bigger
+# cushion under the noise-calibrated delta, which flatters it. That is why the
+# common delta is NOT OPTIONAL and why `delta = 0` is retained.
+delta:
+
+  # Quantiles of the measured per-cell displacement that become the
+  # noise-calibrated tolerance. The median and the 90th percentile are both
+  # defensible; the median says "half of this method's own re-estimations move a
+  # cell by less than this", the 90th says "nine in ten do".
+  noise_quantiles: [0.5, 0.9]
+
+  # THE ROUTE whose displacement calibrates the tolerance, and it is also the
+  # route the stability axis reads. It was `noise_level: sample` until
+  # 2026-09-06, naming a generation STAGE at a time when one stage held three
+  # different estimands: `sample` covered the SHAP bootstrap, the LLR posterior
+  # draws and the LLR bootstrap refits at once. Naming the route instead is
+  # exact, and it is now the single declaration -- `prim_route()` in
+  # `tests/attr_metrics.R` reads this key rather than carrying a literal.
+#
+  # `bootstrap`, because it is the only route both families share and the only
+  # one on which the two are comparable. Calibrating on `seed` would give every
+  # LLR arm a tolerance of exactly zero and every SHAP arm a generous one, which
+  # is the flattery hazard at its worst; calibrating on `posterior` would give
+  # the LLR arms a tolerance from an estimand SHAP has no counterpart for.
+  noise_route: bootstrap
+
+  # The common grid. Identical to the one already used by
+  # `tests/attribution_ties.R`, `tests/shap_noise_floor.R` and
+  # `tests/attribution_vs_shap.R`, so every number reported before 2026-09-06
+  # remains directly comparable.
+  common_absolute: [0, 0.02, 0.05, 0.10, 0.25, 0.50]
+
+  # Share of the patient's OWN total absolute evidence. The scale-matched grid:
+  # the median patient carries 3.24 nats of |SHAP| against 6.84 of |L_cond|, so
+  # an absolute tolerance forgives twice as much of a SHAP disagreement.
+  relative: [0, 0.01, 0.02, 0.05, 0.10]
+
+  # LEADER-COLLAPSE THRESHOLDS, added 2026-09-07. The share of the OTHER arm's
+  # own kept evidence that this arm's top-ranked signal must fall below before
+  # the leader counts as having COLLAPSED rather than merely been reordered.
+#
+  # WHY THE GRID SITS WELL UNDER 1/19. A flat 19-signal vector puts 0.0526 on
+  # every signal, so a leader carrying less than that is already below what an
+  # uninformative attribution would give it. 0.02 is the headline: the leader
+  # has essentially no weight in the other arm. 0.05 is the permissive reading
+  # and 0.01 the strict one; all three are reported and the FIRST is the one
+  # that feeds the per-pair dominance comparison.
+#
+  # MEASURED before the threshold was declared, which is the wrong order and is
+  # recorded as such: `llr_full` against `llr_cond` collapses 3.2% of patients
+  # at 0.02 against a sampling floor of 0.11%, and `llr_full` against
+  # `llr_full_ti_trend` collapses 0.03%, below that floor. The grid was chosen
+  # to bracket 1/19 rather than to produce that separation, but it was chosen
+  # with the separation visible.
+  collapse_shares: [0.01, 0.02, 0.05]
+
+  # Magnitude gate for the sign-flip metric, in nats. A cell moving from +0.001
+  # to -0.001 is not a change of direction, it is arithmetic about a quantity
+  # that was never distinguishable from zero. tau = 0 is retained as the
+  # documented UPPER BOUND.
+  sign_taus: [0, 0.05, 0.10, 0.25, 0.50]
+
+  # How the displacement sample is drawn. B = 40 is 780 pairs of 783,750-cell
+  # matrices; the exact distribution is neither affordable nor needed for a
+  # quantile. Bounded and seeded so the tolerance is reproducible.
+  max_pairs: 45
+  cell_frac: 0.25
+  sample_seed: 20260906
+
+# --- THE DISTRIBUTION TABLES -------------------------------------------------
+#
+# ADDED 2026-09-06. How many pairs each contrast's distribution is built from,
+# and how the two cost regimes are separated.
+#
+# THE TWO REGIMES ARE GENUINELY DIFFERENT AND SHARING ONE BOUND WOULD MEAN
+# TAKING THE WORSE OF THEM. Strict top-k agreement at delta = 0 is a single
+# integer comparison per patient once each replicate's top-k set is bitmask
+# encoded (`attr_topk()`), so it costs nothing and every available pair can be
+# used. Agreement at a positive delta needs the full magnitude matrices and two
+# n x p logical masks per call, so it is bounded by REPLICATES rather than by
+# pairs: holding B preps of a 41,250 x 19 matrix is about 9.4 MB each.
+distribution:
+  # Strict (delta = 0) top-k agreement. 800 covers all C(40,2) = 780 pairs, so
+  # no sampling happens at the declared B and the bound only binds if B grows.
+  max_pairs: 800
+
+  # Replicates entering the positive-delta, cosine and sign-flip tables.
+  # C(16,2) = 120 pairs and about 150 MB held. These metrics are reported as
+  # distributions too; they are simply built from fewer pairs, and the column
+  # `n` on every emitted row says which bound produced it.
+  max_reps_delta: 16
+
+  # Pairs entering the LEADER-COLLAPSE distribution. Bounded separately from
+  # cosine because it costs an order of magnitude more per pair: cosine is three
+  # vector passes once norms are cached, collapse is a masked copy plus two
+  # `max.col` and two `rowSums`. 150 pairs estimate a median and a p95 perfectly
+  # well, and every emitted row carries `n` so the bound that produced it is
+  # never in doubt.
+#
+  # THE RANK-DISPLACEMENT HALF OF THAT METRIC IS NOT COMPUTED ON THIS PATH AT
+  # ALL (`ranks = FALSE`). It needs a `rank()` per patient per matrix, which is
+  # `attr_prep()`'s cost class; computing it here was 2.11 billion calls and
+  # took the consumer from 17 minutes to over 24 and still running. It runs
+  # only on the 56-pair anchor detail table, where the cost is irrelevant.
+  max_pairs_collapse: 150
+
+  # Deterministic pair selection when a bound binds. Declared before generation
+  # so the pair set is a property of the plan and not of the run.
+  pair_seed: 20260906
+
+# --- what is aggregated, and at what level -----------------------------------
+aggregation:
+  # `signal` is the estimation unit -- 19 columns, one per layer-1 bundle.
+  # `domain` is the REPORTING unit: `config/domains.csv`, 11 disjoint domains,
+  # frozen before any result existed. An attribution claim in the paper is made
+  # at the domain level, so every metric is computed at both.
+  levels: [signal, domain]
+  # Ranks at which top-k agreement is reported. 1 is "which signal mattered
+  # most", 3 is "which three", and those are the only two forms a per-patient
+  # explanation is ever written in.
+  top_k: [1, 3]
+
+# --- storage -----------------------------------------------------------------
+storage:
+  # THE FORMAT IS `qs2` AND IS NOT DECLARED HERE. A signal-level replicate is
+  # 41,250 x 19 doubles, about 6.3 MB uncompressed and 3.9 MB written, and B = 40
+  # across seven LLR arms is over a gigabyte, so `rds` is not a real option and a
+  # `format:` key would be a switch with one position. It was here until
+  # 2026-09-06, read by nothing -- `qs2::qs_save()` is called directly -- and
+  # audit B reported it dead.
+#
+  # SIGNAL LEVEL ONLY. The domain matrix is an exact linear function of the
+  # signal matrix (`attr_to_domain()`, equal weight within a domain), so storing
+  # it would be storing a derived quantity beside its input -- two declarations
+  # of one thing, which is the failure mode `cfg_req()` exists to prevent.
+  level: signal
+  # Directory INSIDE the generator's run directory. The generator owns every
+  # path (hard rule 9); this is a name, not a path.
+  subdir: replicates
+
+# --- the selection rule ------------------------------------------------------
+#
+# ---- PROVENANCE, WHICH MUST BE READ BEFORE THE THRESHOLDS -------------------
+#
+# THE FIRST VERSION OF THIS BLOCK WAS FROZEN BEFORE ANY REPLICATE EXISTED. THIS
+# VERSION WAS NOT, AND PRETENDING OTHERWISE WOULD BE THE EXACT DEFECT THE
+# PRE-REGISTRATION EXISTS TO PREVENT. The level-3 point estimates in
+# `out/runs/attrmetrics_20260906T165623` were visible when the two stability
+# thresholds below were chosen. Three things make that acceptable and all three
+# have to travel with the numbers:
+#
+#   THE RULE BEING REPLACED WAS DEFECTIVE, and it was found defective by running
+#   it rather than by disliking its answer. It named "level-4 disagreement
+#   relative to level-3" without naming which pairs count as level 4, and the
+#   three defensible readings gave three different verdicts (plan 21.5). A rule
+#   that cannot identify its own pair set does not become sound by picking one
+#   after the fact.
+#
+#   THE AXIS CHANGED FROM A COMPARATIVE TO AN INTRINSIC ONE. The old axis scored
+#   a method against another method's noise; the new one scores a method against
+#   its own reproducibility. There is no way to carry the old thresholds over,
+#   because they measured a ratio and these measure a disagreement.
+#
+#   THE RULE'S STATUS IS STILL `evaluative_only`. It has never selected
+#   anything and it does not select anything now. Whether any arm enters the
+#   main pipeline remains a separate decision, taken in the open, with these
+#   numbers in hand.
+#
+# STABILITY ALONE IS STILL A TRAP. A model that assigns everything to one signal
+# is perfectly stable and useless, so the rule keeps three axes and a method is
+# excluded only if it fails all three. Anything else is a STATED TRADE-OFF, not
+# a ranking: the three axes are not commensurable and pretending they are would
+# turn a judgement into an arithmetic.
+selection:
+
+  # AXIS 1, STABILITY -- REDEFINED 2026-09-06. A method's OWN level-3
+  # disagreement distribution, scored at two points, on its primary route. The
+  # level-4-over-level-3 ratio is demoted to a reported column; see
+  # `attr_selection_score()`'s header for the four reasons.
+#
+  # BOTH POINTS ARE NEEDED. A median alone lets one horrible tail hide behind a
+  # good typical case; a p95 alone lets one extreme pair condemn a method that
+  # is otherwise reproducible. The MAXIMUM is reported and is deliberately not a
+  # threshold: a maximum grows mechanically as B increases, so a criterion on it
+  # would tighten every time more replicates were generated.
+#
+  # THE NUMBERS. Both are declared conventions and neither is derived. 0.25
+  # says the TYPICAL pair of plausible training samples must leave at least
+  # three patients in four with the same top-attributed signal; 0.35 says even
+  # the unlucky twentieth pair must leave two in three. An explanation of the
+  # form "the top signal for this patient" cannot be written in a paper if a
+  # different but equally plausible training sample would have named a different
+  # signal for a third of the cohort.
+  max_l3_median: 0.25
+  max_l3_p95: 0.35
+
+  # Which contrast the stability axis reads. `L3` is sampling noise with the
+  # algorithmic seed held, which is the like-for-like quantity across the two
+  # families. `L3T` -- resampled AND re-seeded -- is the operational quantity
+  # and is reported beside it, but it is not the criterion, because it is
+  # strictly larger for SHAP and does not exist for any LLR arm (level 2 is
+  # zero for `bam`, so there is no second seed to vary), and scoring on it would
+  # penalise the only family that has an algorithmic noise term at all.
+  stability_contrast: L3
+
+  # WHICH L3 STRATUM, and the key exists because there is now more than one.
+  # Every shared bag carries a fit at `seed_id = 0` and another at each
+  # `seed_id = s`, so a method has a complete, valid L3 distribution at EVERY
+  # held seed -- `(b,0)` against `(b',0)`, `(b,1)` against `(b',1)`, and so on.
+  # All are measurements of the same contrast and none is the obvious reference,
+  # which is exactly the situation in which the choice must be declared rather
+  # than taken by whichever row a `match()` reaches first.
+#
+  # `seed=0` is the base RNG (`cfg$seed + fold`, no offset) and the one the
+  # `ladder` replicate itself uses, so it is the stratum every other table in
+  # this project is already implicitly on. It is also the stratum the paired
+  # SHAP-against-LLR comparison is filtered to at both ends: without that
+  # filter the same bag pair would appear twice on the SHAP side and the
+  # reported difference would depend on row order.
+  stability_stratum: seed=0
+
+  # AXIS 2, RESOLUTION. Share of patients with a unique leader at the
+  # noise-calibrated tolerance. This is what catches degenerate stability. The
+  # threshold is a declared convention rather than a derived quantity: an
+  # explanation of the form "the top signal for this patient" has to be
+  # supportable for a MAJORITY of patients before it can be written in a paper
+  # at all. Hence one half.
+  min_resolution: 0.50
+
+  # WHICH NOISE QUANTILE the resolution axis is evaluated at. It was a literal
+  # `"q0.5"` in the consumer until 2026-09-09 (review finding A7): removing
+  # 0.5 from `delta.noise_quantiles` would have silently produced an unscored
+  # resolution axis instead of a configuration error. Must be one of
+  # `delta.noise_quantiles`; the consumer checks that before reading a matrix.
+  resolution_noise_quantile: 0.5
+
+  # AXIS 3, DISCRIMINATION. The score still has to work. The threshold is
+  # anchored on the largest AUROC gap this project already accepts between two
+  # arms it reports side by side: `llr_sum` minus `llr_cond` is 0.0122 out of
+  # fold, the whole worth of the treatment-propensity block. 0.02 admits that
+  # gap with room and excludes an arm that gives up more discrimination than
+  # the entire propensity block is worth.
+  max_auroc_drop: 0.02
+  auroc_reference: llr_full
+
+  # What the rule is FOR, recorded so a later reader cannot mistake its status.
+  # 2026-09-06: evaluative only. The attribution analysis comes first; whether
+  # any interaction arm enters the main pipeline is a separate decision, is
+  # listed as open decision 1 in the plan, and additionally waits on the eICU
+  # joint-support check (open decision 2).
+  status: evaluative_only
+
+  # LEVEL 4 IS INFORMATION, NOT A CRITERION, and this key records the ruling
+  # rather than leaving it to be inferred from the absence of a threshold. The
+  # level-4 distribution answers "how sensitive are the substantive patient-level
+  # explanations to modelling choices", which is a scientific finding about the
+  # pair of specifications and not a defect in either member of it. It is
+  # reported at every aggregation level, as a distribution over shared bags,
+  # with `attr_dominance()` against the same arms' level 3 beside it.
+  level4_role: information_only

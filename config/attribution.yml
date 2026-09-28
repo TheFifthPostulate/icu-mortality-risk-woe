@@ -1,0 +1,224 @@
+# config/attribution.yml -----------------------------------------------------
+# Per-runner config for run/attribution.R: the attributability arm, MIMIC-only.
+# FITS NOTHING PERMANENT (hard rule 8). The floors refit inside a replicate, but
+# a replicate is never scored, never reported and never enters a bundle -- see
+# `refit_replicate()` in R/13b_attribution_floor.R.
+#
+# WHY THIS FILE EXISTS RATHER THAN A BLOCK IN config/config.yml. Everything
+# here is a RUN parameter, not a design parameter: no key below changes what
+# gets fitted, and `attribution_set()` refuses any cfg that is not
+# `bundle_cfg(bundle, paths)`, so the design cannot enter from here even by
+# accident. Putting them in `config/config.yml` would also change the `cfg`
+# target's value and rebuild all 258 fits to produce identical numbers, which
+# is a cost with no benefit. Same reasoning as config/external.yml.
+#
+# EVERY THRESHOLD BELOW IS DECLARED BEFORE THE RUN, and audit findings F9 to
+# F11 are why they are declared HERE rather than as `%||%` fallbacks beside the
+# call sites: a setting written down twice can be edited apart, and the
+# divergence is invisible until the key is deleted. `run/attribution.R` reads
+# each of these with no fallback.
+# ----------------------------------------------------------------------------
+
+# *** READ THIS BEFORE RUNNING ANYTHING, 2026-09-04. ***
+#
+# The arm's reported quantity was CHANGED on 2026-09-04 and this file still
+# configures the SUPERSEDED one. `docs/v2_attributability_plan_20260902.md`
+# Part Two (sections 14 to 17) replaces the PATTERN-level agreement score --
+# one number per pair of refits -- with a CELL-level uncertainty interval: for
+# each stay and each signal, the spread of that contribution across refits, in
+# nats.
+#
+# WHAT THAT MEANS FOR THIS FILE. `floors:` below declares B as a number of
+# replicate PAIRS, because a similarity score needs two models to compare. The
+# cell version needs B SINGLE refits and harvests one observation per cell
+# rather than one per pair, so both the count and the unit change, and B is to
+# be chosen by watching the per-signal summary stop moving rather than fixed in
+# advance. The per-cell accumulator is NOT built yet (plan section 17, stage 1).
+#
+# SO: `Rscript run/attribution.R` today runs the superseded estimand. It works
+# and it is not wrong, but at `out_of_fold` it costs about 3.5 hours and
+# produces the demoted secondary table rather than the headline. Build stage 1
+# first.
+
+site: mimic
+
+# The bundle to attribute. AN EXPLICIT PATH, for the same reason
+# config/external.yml carries one: a published agreement number must not change
+# because someone re-ran the internal pipeline.
+bundle: out/runs/internal_20260909T112643/bundle.qs2
+
+store: _targets
+
+# --- the evaluation set -----------------------------------------------------
+# "Fix an evaluation set and never move it" (plan section 7). Resampling it too
+# would confound sampling of the evaluation cohort with sampling of the
+# estimator, and the estimator is the only thing under study.
+#
+# *** `split: test` CONFIRMED 2026-09-04. *** The user's ruling: the single
+# look is there to stop metric-chasing, and internal validation and
+# attributability are two different analyses, so a second look is fine here.
+# The argument that was put to them, kept because it belongs in the methods: `v2_attributability_plan_20260902.md` section 12 step 4 says
+# the two-by-two runs "on MIMIC test", and CLAUDE.md says test is touched ONCE,
+# by run/test_look.R. Those look like they collide. They do not, for a reason
+# worth stating in the methods rather than in a comment:
+#
+#   AN ATTRIBUTION-AGREEMENT STATISTIC NEVER TOUCHES THE OUTCOME. Every metric
+#   in this arm compares two attribution matrices with each other. `mortality`
+#   appears nowhere in Spearman agreement, sign agreement, within-patient
+#   ranking or domain composition. The single-look discipline exists so that a
+#   PERFORMANCE number is not peeked at repeatedly and then reported as if it
+#   had been seen once. Nothing here is a performance number, so nothing here
+#   spends the look.
+#
+#   AND TRAIN WOULD BE WORSE. The floors refit on subsets of train, so a train
+#   evaluation set is partly IN-SAMPLE for every replicate, which inflates
+#   agreement by an amount that varies with how much of the set a given
+#   replicate happened to draw. `attribution_floor()` warns about exactly this.
+#   Test is out-of-sample for the bundle and for every replicate alike.
+#
+# Set `split: train` to overrule; the runner honours it and logs the warning.
+eval:
+  split: test
+  # Subsample size, or the string `all` for every stay in the split. The
+  # floors dominate the cost -- one replicate PAIR refits alpha, delta,
+  # lambda, 43 GAMs and three boosters twice -- so start small, confirm the
+  # loop, then raise it. MIMIC test is 10,313 stays.
+  #
+  # *** THE KEY IS `n_stays` AND NOT `n` FOR A REASON. *** This was written as
+  # `n: 4000` and the YAML 1.1 parser read the bare key `n` as the BOOLEAN
+  # FALSE, so the setting arrived as a list element named `FALSE`, `ac$eval$n`
+  # returned NULL, and the runner silently evaluated on all 10,313 stays
+  # instead of 4,000. It is the defect this whole audit is about wearing a new
+  # coat: a declaration that is present, looks correct, and is read as
+  # something else. `y`, `n`, `yes`, `no`, `on`, `off`, `true` and `false` are
+  # all booleans in YAML 1.1 -- never name a key with one of them.
+  #
+  # There is no `~ means all` any more either. A NULL that means something is
+  # a second kind of value hiding in an absent one, and `cfg_req()` cannot
+  # tell it from a missing key. `all` is spelled out.
+  n_stays: 4000
+  # Drawn with this seed and then FROZEN. The same stays are used by every
+  # replicate of every perturbation, which is what makes the floors comparable
+  # to each other.
+  seed: 5333
+
+# --- what is compared -------------------------------------------------------
+# All six arms, so the two-by-two of the plan's section 10 is complete:
+# `llr_sum` against `xgb_l` varies only the aggregator (identical 19 inputs),
+# `xgb_raw` varies the representation, `xgb_feat` sits between them.
+#
+# `llr_cond` added 2026-09-05 at the user's direction: the per-cell noise
+# interval is wanted for the CONDITIONAL contribution as well as the joint one.
+# That is the right instinct and it is arguably the primary cell -- section 16
+# of the plan describes the sentence the arm licenses as being about a
+# measurement channel's evidence GIVEN treatment context, and that sentence is
+# about `L_cond`. `llr_sum` additionally carries `rowSums(L_intv)`, a pure
+# propensity term whose spread is a statement about treatment assignment rather
+# than about the measurement. It costs one subtraction per replicate.
+# THE FOUR INTERACTION ARMS JOINED 2026-09-07, when their GAMs entered the
+# bundle. Every one of them is a sweep of a matrix `attribution_set()` already
+# builds, so the noise-floor replicate loop gets them for free -- what cost
+# compute was the 126 pipeline fits, and those are already spent.
+methods: [llr_sum, llr_cond, llr_meas,
+          llr_sum_ti_trend, llr_sum_ti_all, llr_cond_ti_trend, llr_cond_ti_all,
+          xgb_l, xgb_feat, xgb_raw]
+
+# How SHAP contributions from INTERVENTION columns are handled before the
+# rollup is restricted to the 19 signals.
+#
+#   drop   discard them and report the discarded share. Needs no convention.
+#   split  divide each intervention group equally among the signals it is
+#          paired with. More faithful to what our method does, because
+#          `L_full` for signal g already contains g's paired interventions --
+#          but "equally" is a convention and would have to be declared as one.
+#
+# MEASURED at the smoke test: `xgb_l` discards 0.0000 (its columns ARE the 19
+# signals), `xgb_feat` 10.7%, `xgb_raw` 8.9%. `drop` is the default because it
+# needs no convention; the discarded share is reported beside every number.
+intervention_handling: drop
+
+# Sign agreement needs a magnitude floor in ABSOLUTE LOG-ODDS UNITS, declared
+# before the run and never chosen as a quantile after seeing the distribution.
+# Without one, the metric measures how many near-zero cells exist rather than
+# whether two fits agree: the sign of an attribution of magnitude 0.001 is
+# noise. 0.05 log-odds is about a 5% relative change in odds, which is the
+# smallest contribution worth having an opinion about.
+mag_floor: 0.05
+
+# Within-patient ranking is undefined for a stay with too few measured signals
+# to rank. A stay contributes to metric four only if at least this many of its
+# cells are usable.
+min_signals: 5
+
+# Risk strata for domain composition (metric five). Quartiles, matching the
+# frozen reporting quartiles used everywhere else in the project.
+domain_bins: 4
+
+# --- the floors -------------------------------------------------------------
+# Two perturbations, answering different questions and complementary rather
+# than alternative. The bootstrap gives the VARIANCE of the agreement
+# statistic; the disjoint half gives the LOCATION of its null.
+#
+# Run `disjoint_half` first at B = 5. It is two independent fits per replicate
+# rather than fifty, it exercises the entire replicate loop, and it is the
+# correct null for a transport claim because MIMIC and eICU share no patients
+# either. The bootstrap is the overnight job: two bootstrap resamples share
+# about 63% of their distinct patients, so they agree MORE than two independent
+# samples would, and its floor therefore sits too high.
+#
+# `v2_analysis_tiering.md` item 9 fixes the bootstrap at 50 rather than 200: a
+# gap only visible at 200 is not a gap worth claiming.
+floors:
+  - perturbation: disjoint_half
+    B: 5
+    run: true
+  - perturbation: bootstrap
+    B: 50
+    run: false
+
+# WHERE A REPLICATE'S OWN L MATRIX COMES FROM. This decides whether the floor
+# is a floor for the estimator we actually report, and it is the expensive
+# choice in this file.
+#
+#   out_of_fold  the replicate cross-fits inside its own half and trains its
+#                `xgb_l` booster on OUT-OF-FOLD L, which is what `_targets.R`
+#                does for the real booster (`design_l <- xgb_design_L(l_oof,
+#                ...)`). FAITHFUL. Costs about five times the GAM budget per
+#                replicate: roughly 15 minutes a half rather than 4.5, so a
+#                disjoint-half pair is ~30 minutes and B = 5 is ~2.5 hours.
+#
+#   in_sample    the replicate fits only its final models and derives L by
+#                applying them to their own fitting rows. CHEAP, and it changes
+#                the estimator: in-sample L is less noisy, so two replicates
+#                agree MORE than two genuine refits would and the floor sits
+#                too high, which biases toward declaring a site effect that is
+#                really sampling variation. Same direction of error as the
+#                bootstrap's 63% patient overlap. Use it to prove the loop
+#                runs; declare it if any number from it is reported.
+#
+# Only `xgb_l` is affected. `llr_sum` and `llr_meas` come from the final GAMs,
+# and `xgb_feat` and `xgb_raw` are built from covariates rather than from L.
+replicate_l_source: out_of_fold
+
+# Seed for the replicate draws. Separate from `eval.seed` so that changing the
+# evaluation subsample cannot silently reshuffle which patients land in which
+# half, and vice versa. Same idiom as `assign_folds()`'s two seed streams.
+floor_seed: 5333
+
+# --- what to export ---------------------------------------------------------
+# Aggregates only (hard rule 1). The attribution matrices are row-level, stay
+# in memory and go nowhere: what leaves is correlations, quantiles and counts.
+export:
+  tables:
+    - floor_summary
+    - floor_overall
+    - floor_ranking
+    - method_agreement
+    - domain_composition
+  diagnostics:
+    - attribution_coverage
+    - floor_per_signal
+    - floor_failures
+    - floor_timing
+    - bundle_checks
+    - bundle_contents

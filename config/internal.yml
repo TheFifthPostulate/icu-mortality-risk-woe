@@ -1,0 +1,139 @@
+# config/internal.yml --------------------------------------------------------
+# Per-runner config for run/internal.R and run/test_look.R. It says WHAT TO
+# LOAD and WHAT TO EXPORT, and nothing about the design -- the design lives in
+# config/config.yml and is frozen into the bundle from there.
+#
+# Why a separate file: `export_run()` snapshots named targets out of the
+# `_targets/` store into a dated run directory. That list is a run-level
+# decision, not a design decision, and putting it in config.yml would make
+# every design hash change whenever someone added a table to an export.
+# ----------------------------------------------------------------------------
+
+site: mimic
+config: config/config.yml
+store: _targets
+
+# --- what run/internal.R snapshots out of the graph -------------------------
+# Names must be targets in _targets.R. `tables` and `diagnostics` are written as
+# .rds plus a .csv for eyeballing; `objects` are .rds only, for values that are
+# not rectangular. The bundle is written as .qs2 at the run root.
+#
+# AGGREGATES ONLY leave here as CSV (hard rule 1). `l_oof` and `oof_scores` are
+# row-level and are exported as OBJECTS, so they land as .rds inside the run
+# directory and are never rendered by a CSV reader or a console.
+export:
+  tables:
+    - budget
+    - fold_table
+    - eigen_full_zero
+    - eigen_cond_zero
+    - eigen_full_na
+    - branch_pt
+    - shared_pairs
+    - l_full_summary
+    - l_cond_summary
+    - signal_auroc_full
+    - signal_auroc_cond
+    # The interaction models, added 2026-09-07 with the specs themselves. Each
+    # is one LONG table over the four interaction L matrices rather than four
+    # targets, because the reading is a comparison BETWEEN matrices and a row
+    # kept in a separate file is a row nobody compares.
+    - eigen_ti
+    - signal_auroc_ti
+    - l_ti_summary
+    # The arm-level AUROC/AUPRC table, flat, so it lands as a CSV. `train_ref`
+    # is a nested list and is routed to `objects`, which writes an .rds and no
+    # CSV -- so until 2026-09-05 the only CSV in an internal run directory with
+    # an AUROC column was the PER-SIGNAL one, and it carried no AUPRC at all.
+    - train_ref_arms
+    - bundle_contents
+  diagnostics:
+    - diag_oof
+    - diag_final
+    - diag_nested
+    - xgb_oof_sizes
+    - triage_oof
+    - dm_shrinkage
+    - delta_fit
+    - delta_ordinal_fit
+    - lambda_fit
+    - prior_stability
+    # The prior-fit STATUS POLICY's verdict on every (block, key, fold): PASS,
+    # WARN or FAIL with a reason. `layer1_priors()` applied it strictly before
+    # any GAM was fitted, so every exported row is PASS or WARN; it is exported
+    # so the verdict is a table and not the absence of an error (2026-09-08,
+    # plumbing review F3).
+    - prior_fit_checks
+    # The DM's posterior-predictive check and its dispersion drift across the
+    # coverage range. Both computed by the graph since 2026-09-05; before that
+    # the PPC existed and was exported by nobody.
+    - dm_fit_ppc
+    - dm_drift
+    - feature_manifest
+    - group_gain
+    - bundle_checks
+    # The severity arm's training-side half. `severity_recal` is the object that
+    # TRAVELS -- the MIMIC-fitted intercept and slope every apply site maps its
+    # integer severity scores through -- so it is snapshotted here as well as
+    # carried in the bundle, and a published external number can be traced to
+    # the coefficients that produced it.
+    - severity_recal
+    # The severity coverage diagnostics: APACHE point-by-point coverage, SOFA
+    # organ coverage, and agreement with each site's native score. Computed by
+    # the graph ever since the severity arm landed and exported by NOBODY until
+    # 2026-09-03, so it was recomputed on every run and discarded (audit
+    # finding F4). It matters because the coverage floors decide which stays
+    # enter the severity comparison at all, and the selection they introduce is
+    # a number to report rather than to assume away (CLAUDE.md). It is a named
+    # list of tables, so `export_run()` writes the .rds plus one CSV per element.
+    - severity_diag
+  objects:
+    - severity_oof
+    - severity_cutpoints
+    - severity_train_ref
+    - l_oof
+    - l_nested
+    - oof_scores
+    - cutpoints
+    - sigma
+    - train_ref
+    - jobs
+  bundle: bundle
+
+# --- the single test look ---------------------------------------------------
+# run/test_look.R spends it. Decided 2026-09-01: the one look scores EVERY arm
+# in a single pass rather than APACHE/SOFA alone, because the eICU transport
+# claim needs a held-out MIMIC comparator computed on the identical code path.
+# The APACHE II / SOFA cells remain the pre-registered confirmatory result
+# (CLAUDE.md, frozen decisions); the rest are the descriptive reference points
+# the external comparison is read against.
+#
+# `bundle` is an explicit path, never `latest_run()`. A result must not change
+# because a newer run appeared.
+test_look:
+  bundle: out/runs/internal_20260909T112643/bundle.qs2
+  # `llr_cond` added 2026-09-05. It is not a sixth model: `L_cond = L_full -
+  # L_intv` is derived by subtraction from matrices the apply path already
+  # builds, so the arm costs no fit and does not change the frozen design.
+  # THE FOUR INTERACTION ARMS JOINED 2026-09-07. Unlike `llr_cond` they cost
+  # fits -- 126 of them -- and they are here rather than in an analysis script
+  # because an arm that is not in the bundle cannot be transported: eICU is
+  # scored off frozen GAMs, so `llr_sum_ti_trend` existing only inside
+  # tests/attr_replicates.R meant its attribution stability could be measured
+  # and its discrimination, calibration and transport could not.
+  arms: [llr_sum, llr_cond, llr_meas,
+         llr_sum_ti_trend, llr_sum_ti_all, llr_cond_ti_trend, llr_cond_ti_all,
+         xgb_l, xgb_feat, xgb_raw]
+  # Bin the test scores on the cut points frozen from MIMIC train, so the
+  # 20-bin curve is the same intervals the external site will be read on.
+  frozen_bins: true
+  # `apache_counterpart: llr_meas` and `sofa_counterpart: llr_sum` sat here
+  # until 2026-09-03 and were read by nothing, the same as their twins in
+  # config/external.yml (audit finding F7). The pairing lives in
+  # `SEVERITY_PAIRS` in R/10b_severity.R and is not interchangeable
+  # (docs/severity_baselines.md): APACHE II is pure physiology so it meets
+  # `llr_meas`, SOFA bundles vasopressor dose so it meets `llr_sum`. An apply
+  # site must not be able to choose a different pairing, which is the argument
+  # for the code owning it rather than a per-runner yaml.
+  severity:
+    enabled: true

@@ -1,0 +1,20 @@
+signal,domain,domain_label,sofa_organ,rationale
+mbp,hemodynamic_support,Hemodynamic support,cardiovascular,SOFA cardiovascular; paired to vasopressor and is the circulatory-support construct
+heart_rate,hemodynamic_support,Hemodynamic support,,Leftover rule: circulatory system; shares the vasopressor support context with mbp
+spo2,respiratory_support,Respiratory support,respiratory,SOFA respiratory; carries both invasive_vent and fio2 context in one model
+resp_rate,respiratory_support,Respiratory support,,Leftover rule: respiratory system; shares invasive_vent context with spo2
+glucose,glycemic_regulation,Glycemic regulation,,Leftover rule: endocrine regulation; no SOFA organ; standalone
+gcs_motor,neuro_sedation,Neurologic state under sedation,cns,SOFA CNS; one of three components summed at layer 2 but modelled separately
+gcs_eyes,neuro_sedation,Neurologic state under sedation,cns,SOFA CNS; one of three components summed at layer 2 but modelled separately
+gcs_verbal,neuro_sedation,Neurologic state under sedation,cns,SOFA CNS; one of three components summed at layer 2 but modelled separately
+urine_output_rate,renal_urinary,Renal/urinary function,renal,SOFA renal; flow. Kept a separate model from creatinine - flow and clearance dissociate
+creatinine,renal_urinary,Renal/urinary function,renal,SOFA renal; clearance. Kept a separate model from urine output
+bun,renal_urinary,Renal/urinary function,,Leftover rule: nitrogen clearance is renal by measured quantity
+platelet,hematologic_support,Hematologic support,coagulation,SOFA coagulation; domain widened from coagulation to hematologic so hemoglobin can join
+hemoglobin,hematologic_support,Hematologic support,,Leftover rule: oxygen-carrying capacity; transfusion-supported like platelet
+temperature,inflammatory_response,Systemic inflammatory response,,Leftover rule: systemic inflammatory response
+wbc,inflammatory_response,Systemic inflammatory response,,Leftover rule: systemic inflammatory response
+bicarbonate,acid_base,Acid-base status,,Leftover rule: acid-base status; singleton
+sodium,electrolyte_osmotic,Electrolyte/osmotic status,,Leftover rule: osmotic and electrolyte status; singleton
+lactate,perfusion_metabolic,Perfusion/metabolic stress,,"Leftover rule: perfusion. Deliberately NOT folded into hemodynamics - it is a downstream consequence marker, not a support construct"
+bilirubin_total,hepatobiliary,Hepatobiliary function,liver,SOFA liver; singleton

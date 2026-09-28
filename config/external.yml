@@ -1,0 +1,160 @@
+# config/external.yml --------------------------------------------------------
+# Per-runner config for run/external.R: eICU. FITS NOTHING (hard rule 8).
+#
+# There is deliberately no design here. Every whitelist, formula parameter,
+# `smooth_k` entry and level-term rule that eICU is scored under comes out of
+# the BUNDLE, via `bundle_cfg()`. Reading config/config.yml at this site would
+# let an edit made between the MIMIC fit and the eICU apply change the design
+# without changing anything visible, and the transport result would be about
+# nothing. This file supplies only the site's paths and its run-level choices.
+# ----------------------------------------------------------------------------
+
+site: eicu
+
+# The bundle to apply. AN EXPLICIT PATH, never `latest_run("internal")`: a
+# published external result must not change because someone re-ran the internal
+# pipeline. Fill this in from the internal run directory, then leave it alone.
+bundle: out/runs/internal_20260909T112643/bundle.qs2
+
+# The internal run whose test-look numbers this external run is compared
+# against. Recorded in the manifest so the transport table names its comparator.
+compare_to: ~
+
+# Where the four canonical tables are. Same keys as `paths.mimiciv`; no
+# `ordering`, which was never extracted at eICU and is audit-only at MIMIC.
+paths:
+  cohort:                 data/eicu/v2_cohort_eicu.parquet
+  signal_features:        data/eicu/v2_features_signals_eicu.parquet
+  intervention_features:  data/eicu/v2_intervention_features_eicu.parquet
+  severity:               data/eicu/v2_severity_eicu.parquet
+
+# Read separately from the four canonical tables: it carries no modelled column
+# and load_tables() does not know about it.
+hospital_table: data/eicu/v2_cohort_hospital_eicu.parquet
+
+# --- what to score ----------------------------------------------------------
+# The same six arms the test look uses, computed by the same `apply_bundle()`
+# call. An arm absent from the bundle is an error, not a shorter table.
+#
+# `llr_cond` added 2026-09-05 and it matters most HERE. `llr_sum` bundles the
+# measurement-deviation evidence with a pure treatment-propensity term, and
+# treatment propensity is exactly the thing most likely to differ between one
+# Boston academic centre and 166 hospitals -- so a transport gap in `llr_sum`
+# is currently unattributable between "the physiology does not transport" and
+# "who gets treated does not transport". `llr_cond` and the `llr_sum -
+# llr_cond` contrast separate those two readings, at no fitting cost.
+# THE FOUR INTERACTION ARMS JOINED 2026-09-07. Unlike `llr_cond` they cost
+# fits -- 126 of them -- and they are here rather than in an analysis script
+# because an arm that is not in the bundle cannot be transported: eICU is
+# scored off frozen GAMs, so `llr_sum_ti_trend` existing only inside
+# tests/attr_replicates.R meant its attribution stability could be measured
+# and its discrimination, calibration and transport could not.
+arms: [llr_sum, llr_cond, llr_meas,
+       llr_sum_ti_trend, llr_sum_ti_all, llr_cond_ti_trend, llr_cond_ti_all,
+       xgb_l, xgb_feat, xgb_raw]
+
+# Bin on the cut points frozen from MIMIC train. This is what turns the 20-bin
+# curve from "eICU's own quantiles, monotone by construction" into the transport
+# question: does a given score value carry the same risk at the other site?
+# The self-binned curve is ALSO written, because the two answer different
+# questions and reporting only one of them would hide a calibration shift.
+frozen_bins: true
+self_bins: true
+
+# --- between-hospital heterogeneity ------------------------------------------
+# The result eICU is uniquely able to supply: 166 hospitals against MIMIC's one.
+# The pooled AUROC and the median within-hospital AUROC answer different
+# questions. THEIR DIFFERENCE IS A DESCRIPTIVE CONTRAST, not a decomposition
+# (external runner review E8, 2026-09-09): the pooled value weights
+# positive-negative pairs, the median weights eligible hospitals equally, and
+# hospital selection and unequal within-hospital discrimination both move the
+# gap. It is reported on the eligible cohort, beside both pooled values.
+#
+# THE THRESHOLDS ARE DECLARED BEFORE THE RUN, never chosen after seeing the
+# spread -- same discipline as the diagnostic thresholds and the XGBoost
+# hyperparameters. A hospital below either floor is excluded and COUNTED, never
+# reported with a wide interval: an AUROC over 30 stays with 2 deaths is not a
+# noisy estimate of that hospital's discrimination, it is a statement about
+# which two patients died.
+hospital:
+  enabled: true
+  group_col: hospitalid
+  min_stays: 100
+  min_events: 10
+  # WHAT HAPPENS TO A SCORED STAY THE HOSPITAL TABLE DOES NOT COVER (external
+  # runner review E4, 2026-09-09). `exclude` drops it from the hospital
+  # analysis and COUNTS it: the summary carries `n_scored`, `n_matched` and
+  # `n_unmatched` separately, and every coverage fraction names its
+  # denominator. `error` stops the run. Declared here because the choice
+  # changes what population the heterogeneity table describes; the previous
+  # behaviour was `exclude` with a logged count and no denominator, and the
+  # last completed run matched every stay, so `exclude` moves no number.
+  # Required when `enabled: true`; there is no fallback in the runner.
+  unmatched_policy: exclude
+  # `print_identifiers: false` sat here until 2026-09-03 and was read by nothing
+  # (audit finding F7). REMOVED RATHER THAN WIRED, and the direction matters:
+  # hospital identifiers are row-level under the PhysioNet DUA, `run/external.R`
+  # writes the per-hospital table as an object and prints only the
+  # distribution, and it does so unconditionally. A key that reads as a switch
+  # able to turn that off is worse than no key, because the option it appears
+  # to offer must never be taken.
+
+# --- severity arms ----------------------------------------------------------
+# APACHE II physiology-only meets `llr_meas`; SOFA meets `llr_sum`. The pairing
+# is not interchangeable (docs/severity_baselines.md, and CLAUDE.md's note on
+# why SOFA is lineage rather than a third baseline).
+# `apache_counterpart` and `sofa_counterpart` sat here until 2026-09-03 and
+# were read by nothing (audit finding F7). The pairing is `SEVERITY_PAIRS` in
+# `R/10b_severity.R`, which is where it belongs: it is not interchangeable, it
+# is the same at both apply sites, and an apply site must not be able to choose
+# a different one. The yaml agreed with the code, which is exactly why nobody
+# noticed it was inert.
+severity:
+  enabled: true
+
+# --- the two site risks, checked rather than assumed ------------------------
+# Both are already mitigated in code and unverified in eICU data
+# (docs/v2_next_steps_20260831 section 3):
+#
+#   agent_pool   counting distinct drug NAMES rather than distinct MOLECULES
+#                inflates eICU's n_agents 2-4x and would read as case mix.
+#                check_agent_pool() turns that into a loud failure.
+#   prior_fit    the frozen delta/lambda conditional means get evaluated on
+#                eICU's coverage distribution. `a2` is the log(n) coverage
+#                adjustment and the least fold-stable parameter at MIMIC, so it
+#                is the first thing to watch here.
+#
+#                THIS KEY WAS DECLARED `true` AND READ BY NOTHING UNTIL
+#                2026-09-03, and the check it names did not exist: `run/external.R`
+#                contained no call into R/04c at all, so every external run to
+#                date reported prior transport by not looking at it (audit
+#                finding F1). It is now wired, and the run writes
+#                `prior_dm_shrinkage`, `prior_delta_fit`,
+#                `prior_delta_ordinal_fit` and `prior_lambda_fit` into the run
+#                directory's diagnostics. Nothing is re-fitted: the parameters
+#                come out of the bundle and are evaluated, which is what makes
+#                the difference against the internal run's tables a transport
+#                reading rather than two independent fits.
+#
+# `design_checks_strict: false` because a DECLARATION FAILURE HERE IS A RESULT,
+# not a crash: a declaration that holds at MIMIC and not at eICU is exactly
+# what external validation is for. It is recorded and reported, and the run
+# continues so the rest of the table exists to interpret it against.
+#
+# THE SWITCH IS NOW ENFORCED (external runner review E2, 2026-09-09). Until
+# then `true` reached the validators but the runner converted their stop into
+# a table row and applied the models anyway. Now: under `true` any failed
+# check writes `diagnostics/site_checks`, stamps the manifest `failed` and
+# stops before `apply_bundle()`. Under `false` a declaration discrepancy (the
+# validator's WARNING) is a recorded finding and the run continues, while an
+# unexpected exception from a validator -- a check that could not be
+# evaluated at all -- is fatal in both modes, because that is not a finding
+# about eICU.
+#
+# `schema_equality` compares the eICU post-loader schema against the schema
+# FROZEN IN THE BUNDLE when the bundle carries one (review E7), and against
+# the live MIMIC extraction otherwise; the manifest records which.
+checks:
+  schema_equality: true
+  design_checks_strict: false
+  prior_fit_diagnostics: true
