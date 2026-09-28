@@ -1,0 +1,703 @@
+-- =====================================================================
+-- v2 STEP 6: eICU-CRD severity-score comparators (APACHE and SOFA)
+--
+-- PORT OF sql/mimiciv/v2_06_severity_mimiciv.sql. Read that file first:
+-- it carries the design argument for why the APACHE arm exists, why the
+-- recomputed score is APACHE II rather than III or IV, why SOFA is here
+-- and is not a third baseline, and why the overlapping variables are read
+-- back out of our own hourly lattice instead of from source. None of that
+-- is repeated here.
+--
+-- THE ONE THING THAT IS DIFFERENT FOR SOFA AT eICU, and it is worth
+-- stating up front. eICU ships NO SOFA of any kind. The `sofa_native_*`
+-- columns are therefore structurally NULL here, exactly as
+-- `severity_total_native` is structurally NULL at MIMIC. This is not a
+-- gap in the arm; it is the reason the arm was designed the way it was.
+-- The SOFA that transports is the one R/09d_sofa.R RECOMPUTES from the
+-- inputs below, validated at MIMIC against `first_day_sofa` and then
+-- applied unchanged here. If the recomputation is not validated at MIMIC
+-- first, the eICU SOFA number means nothing, because there is nothing at
+-- eICU to check it against.
+--
+-- Every design decision is carried over unchanged; only the sources
+-- differ. Where eICU cannot express a MIMIC concept the substitution is
+-- named in the SITE SUBSTITUTIONS block below. Nothing is substituted
+-- silently.
+--
+-- OUTPUT CONTRACT. This table must emit EXACTLY the columns of
+-- R/02_validate.R CONTRACT$severity (minus `site`, which the loader
+-- stamps), in the same order and the same types as the MIMIC file. Check
+-- 9 compares types across sites, so a FLOAT64 where MIMIC has INT64 fails
+-- the run rather than producing a transportability artifact.
+--
+-- ---------------------------------------------------------------------
+-- SITE SUBSTITUTIONS
+-- ---------------------------------------------------------------------
+--   aps_native          `apachePatientResult.acutephysiologyscore`, the
+--                       APACHE IVa acute physiology score. MIMIC's is APS
+--                       III. BOTH ARE PHYSIOLOGY-ONLY and each is its
+--                       site's canonical severity physiology score, so
+--                       they play the same ROLE. They are NOT the same
+--                       QUANTITY and must never be put on one axis, or
+--                       differenced, or pooled. `aps_native_version`
+--                       records which one a row carries, as a value and
+--                       not as a branch. The cross-site claim rides on
+--                       the RECOMPUTED APACHE II score, which is
+--                       identical at both sites by construction.
+--
+--   aps_native_prob     `predictedhospitalmortality`. This is a stronger
+--                       object than MIMIC's `apsiii_prob`: it is APACHE
+--                       IVa's full fitted model, including age, chronic
+--                       health and admission diagnosis, not a logistic
+--                       remapping of the physiology score alone. It is
+--                       therefore the single hardest baseline in the
+--                       project and it belongs in the paper for exactly
+--                       that reason. Sentinel -1 means "not computed" and
+--                       is mapped to NULL below.
+--
+--   severity_total_native  `apachescore`, the APACHE IVa total. MIMIC
+--                       emits a typed NULL here because mimic-code does
+--                       not ship an APACHE III total. Same sentinel
+--                       handling.
+--
+--   APACHE VERSION      `apachePatientResult` has ONE ROW PER VERSION per
+--                       stay, typically both 'IV' and 'IVa'. A naive join
+--                       silently doubles the cohort. IVa is preferred and
+--                       IV is the fallback; the choice is made in SQL,
+--                       recorded in `aps_native_version`, and the
+--                       de-duplication is asserted by audit A1.
+--
+--   THE FOUR GAP VARIABLES (potassium, haematocrit, arterial pH, and the
+--                       oxygenation triple) come from `apacheApsVar`
+--                       rather than from `lab`. This is the one real
+--                       approximation in the file and it is deliberate.
+--                       `apacheApsVar` holds APACHE IV's own worst
+--                       day-one value per variable: ONE number, not a
+--                       min/max pair. So `_min` and `_max` are set to the
+--                       same value and the R scorer's "score both ends,
+--                       keep the worse" reduces to scoring that value.
+--                       Two reasons this is better than parsing `lab`:
+--                       the worst-value selection is APACHE's own and is
+--                       therefore the selection an APACHE II
+--                       implementation would want, and eICU's `lab` is
+--                       free-text-named with per-hospital unit variation
+--                       that would need its own audit round. The cost is
+--                       that APACHE IV's notion of "worst" can differ
+--                       from APACHE II's for a two-sided variable: for
+--                       potassium APACHE IV may keep the high value where
+--                       APACHE II would score the low one. The
+--                       divergence is confined to variables OUR DESIGN
+--                       DOES NOT CARRY, so it cannot touch the nine-way
+--                       like-for-like comparison, and `ap2_gap_source`
+--                       makes it visible in the data.
+--                       Sentinel -1 is used throughout apacheApsVar for
+--                       "not measured" and is mapped to NULL below. This
+--                       is the single most likely way to get a wrong
+--                       answer from this table: a -1 potassium scores 4
+--                       points on APACHE II's low band and would silently
+--                       inflate the baseline for every unmeasured stay.
+--
+--   ap2_gcs_min_native  `apacheApsVar.eyes + motor + verbal`, APACHE's
+--                       own worst day-one GCS. MIMIC uses
+--                       `mimiciv_derived.gcs`. Both are the site's
+--                       canonical total GCS.
+--   ap2_gcs_min_ours    rebuilt from our hourly components, as at MIMIC.
+--                       eICU has NO `gcs_unable` analogue, so verbal is
+--                       never masked here and this column will agree with
+--                       the hourly data much more closely than at MIMIC.
+--                       That asymmetry is the point of carrying both.
+--
+--   chronic_*           `apachePredVar`'s prospectively collected flags.
+--                       MIMIC uses ICD-derived Charlson components. THESE
+--                       ARE DIFFERENT CONSTRUCTS WITH DIFFERENT
+--                       ASCERTAINMENT and the difference runs in a known
+--                       direction: eICU's flags are APACHE's own
+--                       definitions, recorded for scoring, while
+--                       Charlson's are billing diagnoses. Any comparison
+--                       using them is secondary and site-approximate, and
+--                       must say so. The physiology comparison, which is
+--                       the headline, does not touch them.
+--
+--   admission_class     `apachePredVar.electivesurgery` gives the
+--                       elective/emergency split directly, which is
+--                       better than MIMIC's care-unit proxy. The
+--                       operative/non-operative split uses
+--                       `patient.apacheadmissiondx`. Sentinel -1 again.
+--
+--   ap2_urine_ml_24h    Reconstituted from our own urine rate exactly as
+--                       at MIMIC. NOT `apacheApsVar.urine`, even though
+--                       that column exists and is already in mL/day,
+--                       because using it here and our rate at MIMIC would
+--                       make the one column that feeds the ARF rule
+--                       site-dependent.
+--
+--   ap2_dialysis        our own `rrt` intervention, as at MIMIC.
+--                       `apacheApsVar.dialysis` exists and is not used,
+--                       for the same reason.
+-- =====================================================================
+
+-- =====================================================================
+-- VERIFY BEFORE RUNNING.
+-- =====================================================================
+-- V1. apachePatientResult really does carry more than one row per stay,
+--     and IVa is present for most of them.
+--     SELECT apacheversion, COUNT(*) AS n,
+--            COUNT(DISTINCT patientunitstayid) AS n_stays
+--     FROM `physionet-data.eicu_crd.apachepatientresult` GROUP BY 1;
+--
+-- V2. The sentinel really is -1 and not something else. Look at the
+--     minimum of every apacheApsVar column you intend to use.
+--     SELECT MIN(ph), MIN(pao2), MIN(pco2), MIN(fio2), MIN(hematocrit),
+--            MIN(creatinine), MIN(eyes), MIN(motor), MIN(verbal)
+--     FROM `physionet-data.eicu_crd.apacheapsvar`;
+--     Every one of these should come back -1. If any comes back 0 or a
+--     large negative number, the CASE guards below are wrong and the
+--     baseline is corrupted in the direction that FLATTERS our arm.
+--
+-- V3. apacheApsVar has no potassium column. CONFIRM the column list
+--     before relying on the fallback path below.
+--     SELECT column_name FROM
+--     `physionet-data.eicu_crd.INFORMATION_SCHEMA.COLUMNS`
+--     WHERE table_name = 'apacheapsvar' ORDER BY ordinal_position;
+--     Documented columns: intubated, vent, dialysis, eyes, motor, verbal,
+--     meds, urine, wbc, temperature, respiratoryrate, sodium, heartrate,
+--     meanbp, ph, hematocrit, creatinine, albumin, pao2, pco2, bun,
+--     glucose, bilirubin, fio2. POTASSIUM IS NOT AMONG THEM, which is why
+--     it is the one gap variable taken from `lab`.
+--
+-- V4. The `lab` potassium labname. eICU's lab names are free text.
+--     SELECT labname, COUNT(*) AS n, COUNT(DISTINCT labmeasurenamesystem)
+--     FROM `physionet-data.eicu_crd.lab`
+--     WHERE LOWER(labname) LIKE '%potassium%' GROUP BY 1 ORDER BY n DESC;
+--     Expect 'potassium' to dominate. If a second variant carries real
+--     volume, add it to the filter and re-run; do not leave it out.
+--
+-- V5. Coverage, AFTER running.
+--     SELECT COUNT(*) AS n,
+--            COUNTIF(aps_native IS NULL)     AS n_no_native,
+--            AVG(ap2_n_vars_present)         AS mean_vars_present,
+--            COUNTIF(ap2_n_vars_present < 8) AS n_thin
+--     FROM `...v2_severity_eicu`;
+--     Compare mean_vars_present against MIMIC's. A materially lower value
+--     at eICU is a site difference in the BASELINE's coverage and must be
+--     reported beside any AUROC gap, because a thinner APACHE II score is
+--     a weaker APACHE II score.
+-- =====================================================================
+
+CREATE OR REPLACE TABLE
+  `eicu-ext.eicu_ext_data.v2_severity_eicu`
+CLUSTER BY stay_id AS
+
+WITH cohort AS (
+  SELECT stay_id, weight_kg
+  FROM `eicu-ext.eicu_ext_data.v2_cohort_eicu`
+),
+
+-- ---------------------------------------------------------------------
+-- BLOCK 1. The native score: APACHE IVa.
+--
+-- One row per stay, IVa preferred over IV. The ROW_NUMBER is not a
+-- convenience: `apachePatientResult` carries one row per version and a
+-- plain join would duplicate every stay, which would then silently
+-- reweight the whole comparison towards stays that happen to have both
+-- versions computed.
+--
+-- Sentinel -1 means "APACHE declined to score this stay" and is mapped to
+-- NULL. Leaving it as -1 would give the least-scoreable stays the LOWEST
+-- severity, which inverts the variable.
+-- ---------------------------------------------------------------------
+native AS (
+  SELECT
+    patientunitstayid AS stay_id,
+    CASE WHEN acutephysiologyscore >= 0
+         THEN CAST(acutephysiologyscore AS INT64) END       AS aps_native,
+    CONCAT('apache_', LOWER(apacheversion))                 AS aps_native_version,
+    CASE WHEN predictedhospitalmortality >= 0
+         THEN CAST(predictedhospitalmortality AS FLOAT64) END AS aps_native_prob,
+    CASE WHEN apachescore >= 0
+         THEN CAST(apachescore AS INT64) END                AS severity_total_native
+  FROM (
+    SELECT
+      r.*,
+      ROW_NUMBER() OVER (
+        PARTITION BY r.patientunitstayid
+        ORDER BY CASE WHEN r.apacheversion = 'IVa' THEN 0 ELSE 1 END,
+                 r.apacheversion
+      ) AS rn
+    FROM `physionet-data.eicu_crd.apachepatientresult` r
+  )
+  WHERE rn = 1
+),
+
+-- ---------------------------------------------------------------------
+-- BLOCK 2. The nine APACHE II variables we already extract. VERBATIM
+-- from the MIMIC file apart from the table name.
+-- ---------------------------------------------------------------------
+ours AS (
+  SELECT
+    stay_id,
+    MIN(IF(signal = 'temperature', hr_min, NULL)) AS temp_min,
+    MAX(IF(signal = 'temperature', hr_max, NULL)) AS temp_max,
+    MIN(IF(signal = 'mbp',         hr_min, NULL)) AS mbp_min,
+    MAX(IF(signal = 'mbp',         hr_max, NULL)) AS mbp_max,
+    MIN(IF(signal = 'heart_rate',  hr_min, NULL)) AS hr_min_v,
+    MAX(IF(signal = 'heart_rate',  hr_max, NULL)) AS hr_max_v,
+    MIN(IF(signal = 'resp_rate',   hr_min, NULL)) AS rr_min,
+    MAX(IF(signal = 'resp_rate',   hr_max, NULL)) AS rr_max,
+    MIN(IF(signal = 'sodium',      hr_min, NULL)) AS na_min,
+    MAX(IF(signal = 'sodium',      hr_max, NULL)) AS na_max,
+    MIN(IF(signal = 'bicarbonate', hr_min, NULL)) AS hco3_min,
+    MAX(IF(signal = 'bicarbonate', hr_max, NULL)) AS hco3_max,
+    MIN(IF(signal = 'creatinine',  hr_min, NULL)) AS creat_min,
+    MAX(IF(signal = 'creatinine',  hr_max, NULL)) AS creat_max,
+    MIN(IF(signal = 'wbc',         hr_min, NULL)) AS wbc_min,
+    MAX(IF(signal = 'wbc',         hr_max, NULL)) AS wbc_max,
+    -- SOFA-only, VERBATIM from MIMIC. See that file's block 2.
+    MIN(IF(signal = 'platelet',        hr_min, NULL)) AS plt_min,
+    MAX(IF(signal = 'bilirubin_total', hr_max, NULL)) AS bili_max,
+    SUM(IF(signal = 'urine_output_rate', hr_med, NULL)) AS uo_rate_sum
+  FROM `eicu-ext.eicu_ext_data.v2_hourly_eicu`
+  WHERE hour_bin BETWEEN 0 AND 23
+  GROUP BY stay_id
+),
+
+-- ---------------------------------------------------------------------
+-- BLOCK 3. GCS, twice. See the MIMIC file's block 3 for why.
+--
+-- `ap2_gcs_min_native` is APACHE's own worst day-one total. The three
+-- components must ALL be present: summing across a NULL would produce a
+-- total that is low because a component is missing rather than because
+-- the patient is obtunded, and low-because-missing scores as
+-- severely-impaired on the 15 - GCS rule.
+-- ---------------------------------------------------------------------
+gcs_native AS (
+  SELECT
+    patientunitstayid AS stay_id,
+    CAST(eyes + motor + verbal AS INT64) AS gcs_min_native
+  FROM `physionet-data.eicu_crd.apacheapsvar`
+  WHERE eyes >= 1 AND motor >= 1 AND verbal >= 1
+    AND eyes + motor + verbal BETWEEN 3 AND 15
+),
+
+-- VERBATIM from MIMIC except the table name. The COALESCE(verbal, 1)
+-- branch is inherited rather than needed: eICU never masks verbal, so it
+-- fires only where verbal genuinely was not charted in that hour.
+-- MEASURED 2026-08-30, audit A4: the single-constant version of this column
+-- was not measuring what it claimed. At MIMIC it differs from the native
+-- total on 41.4% of stays with a mean gap of 3.80 points, and eICU -- which
+-- masks nothing -- shows a gap of 0.12. So the gap is the VERBAL CONVENTION
+-- and not hourly binning, and its magnitude is consistent with the derived
+-- concept treating unassessable verbal as NORMAL where we treated it as
+-- WORST. A 3.8-point shift is 3.8 APACHE II points and up to 2 SOFA CNS
+-- points on two fifths of the cohort, which is not a minor implementation
+-- detail.
+--
+-- TWO COLUMNS, NOT A TUNED CONSTANT. The obvious repair is to pick an
+-- imputation value that closes the gap against the native score. That is
+-- backwards: this column exists to show what OUR masking rule does
+-- differently, so fitting its constant until it agrees with the thing it is
+-- a sensitivity against would leave it measuring nothing. Instead both
+-- defensible conventions are emitted and the paper reports the bracket:
+--
+--   gcs_min_ours        verbal imputed 1 -- the PESSIMISTIC bound. Asserts an
+--                       unassessable patient is unresponsive.
+--   gcs_min_ours_vnorm  verbal imputed 5 -- the OPTIMISTIC bound, and the
+--                       standard prospective convention ("assume normal if
+--                       intubated").
+--
+-- The truth for any given stay is inside that interval and the two bound the
+-- baseline's strength. Dropping the hour entirely was considered and
+-- rejected: it would leave deeply sedated intubated patients with no GCS at
+-- all, and an unmeasured variable scores zero points, so the baseline would
+-- collapse on exactly the sickest subgroup -- the same asymmetry in a new
+-- place, and a worse one.
+gcs_ours AS (
+  SELECT
+    stay_id,
+    MIN(gcs_total_v1)    AS gcs_min_ours,
+    MIN(gcs_total_vnorm) AS gcs_min_ours_vnorm
+  FROM (
+    SELECT
+      stay_id,
+      hour_bin,
+      MIN(IF(signal = 'gcs_motor', hr_min, NULL)) +
+      MIN(IF(signal = 'gcs_eyes',  hr_min, NULL)) +
+      COALESCE(MIN(IF(signal = 'gcs_verbal', hr_min, NULL)), 1) AS gcs_total_v1,
+      MIN(IF(signal = 'gcs_motor', hr_min, NULL)) +
+      MIN(IF(signal = 'gcs_eyes',  hr_min, NULL)) +
+      COALESCE(MIN(IF(signal = 'gcs_verbal', hr_min, NULL)), 5) AS gcs_total_vnorm
+    FROM `eicu-ext.eicu_ext_data.v2_hourly_gcs_eicu`
+    WHERE hour_bin BETWEEN 0 AND 23
+    GROUP BY stay_id, hour_bin
+  )
+  -- Bound on the pessimistic total; motor+eyes lies in [2, 10], so v1 in
+  -- [3, 11] and vnorm in [7, 15] follow and neither can leave the scale.
+  WHERE gcs_total_v1 BETWEEN 3 AND 15
+  GROUP BY stay_id
+),
+
+-- ---------------------------------------------------------------------
+-- BLOCK 4/5 COMBINED. The gap variables, from APACHE's own day-one worst
+-- values. See the SITE SUBSTITUTIONS block for why this is one CTE here
+-- and two at MIMIC.
+--
+-- EVERY column is guarded against the -1 sentinel. The same plausibility
+-- bounds as the MIMIC file are applied on top, so an out-of-range value
+-- is dropped at both sites by the same rule.
+--
+-- A-aDO2 needs PaO2, PaCO2 and FiO2 from one gas. apacheApsVar's three
+-- values are each the worst of their own kind and are NOT guaranteed to
+-- come from one specimen, so the coherent-gas guarantee the MIMIC file
+-- gives via ARRAY_AGG does not hold here. This is stated rather than
+-- fixed: recovering it would mean going to `lab` and re-solving the
+-- specimen-pairing problem eICU's schema does not support.
+-- ---------------------------------------------------------------------
+apsvar AS (
+  SELECT
+    patientunitstayid AS stay_id,
+    CASE WHEN ph         BETWEEN 6.5 AND 8.0 THEN CAST(ph AS FLOAT64) END         AS ph_v,
+    CASE WHEN pao2       BETWEEN 20  AND 700 THEN CAST(pao2 AS FLOAT64) END       AS pao2_v,
+    CASE WHEN pco2       BETWEEN 5   AND 200 THEN CAST(pco2 AS FLOAT64) END       AS paco2_v,
+    -- eICU charts FiO2 as a PERCENT (21-100); MIMIC's `bg.fio2` is also a
+    -- percent. The R scorer converts once, for both sites. Do not divide
+    -- by 100 here or the two sites will disagree by a factor of 100 in a
+    -- variable whose only use is a >= 0.5 threshold.
+    CASE WHEN fio2       BETWEEN 21  AND 100 THEN CAST(fio2 AS FLOAT64) END       AS fio2_v,
+    -- SOFA's respiration input, ADDED 2026-08-31. At MIMIC this needs its
+    -- own gas selection because the worst PaO2 and the worst P/F ratio are
+    -- different specimens (see that file's block 5b). eICU has no choice
+    -- to make: `apacheApsVar` holds ONE worst value per variable, so the
+    -- ratio is formed from the pair on hand. That is a weaker construction
+    -- than MIMIC's and it is the same approximation SITE SUBSTITUTIONS
+    -- already documents for the gap variables -- the two values are each
+    -- the worst of their own kind and need not come from one specimen.
+    -- Stated, not fixed: recovering it would mean going to `lab` and
+    -- re-solving a specimen-pairing problem eICU's schema does not
+    -- support.
+    CASE WHEN pao2 BETWEEN 20 AND 700 AND fio2 BETWEEN 21 AND 100
+         THEN CAST(pao2 AS FLOAT64) / (CAST(fio2 AS FLOAT64) / 100) END          AS pf_v,
+    CASE WHEN hematocrit BETWEEN 5   AND 80  THEN CAST(hematocrit AS FLOAT64) END AS hct_v
+  FROM `physionet-data.eicu_crd.apacheapsvar`
+),
+
+-- Potassium is the one gap variable apacheApsVar does not carry, so it
+-- comes from `lab` with the same window and the same plausibility bound
+-- as MIMIC's labevents branch. Min and max are both real here, unlike
+-- the apsvar-sourced variables.
+potassium AS (
+  SELECT
+    patientunitstayid AS stay_id,
+    MIN(CAST(labresult AS FLOAT64)) AS k_min,
+    MAX(CAST(labresult AS FLOAT64)) AS k_max
+  FROM `physionet-data.eicu_crd.lab`
+  WHERE LOWER(labname) = 'potassium'
+    AND labresultoffset BETWEEN 0 AND 1440
+    AND labresult BETWEEN 1.0 AND 10.0
+  GROUP BY patientunitstayid
+),
+
+-- ---------------------------------------------------------------------
+-- BLOCK 6. Chronic health and admission type. SECONDARY AND
+-- SITE-APPROXIMATE; see the MIMIC file's block 6 and the SITE
+-- SUBSTITUTIONS block above.
+-- ---------------------------------------------------------------------
+pred AS (
+  SELECT
+    patientunitstayid AS stay_id,
+    CAST(GREATEST(
+      CASE WHEN aids             = 1 THEN 1 ELSE 0 END,
+      CASE WHEN lymphoma         = 1 THEN 1 ELSE 0 END,
+      CASE WHEN leukemia         = 1 THEN 1 ELSE 0 END,
+      CASE WHEN metastaticcancer = 1 THEN 1 ELSE 0 END,
+      CASE WHEN immunosuppression = 1 THEN 1 ELSE 0 END
+    ) AS INT64) AS chronic_immunocompromised,
+    CAST(GREATEST(
+      CASE WHEN cirrhosis      = 1 THEN 1 ELSE 0 END,
+      CASE WHEN hepaticfailure = 1 THEN 1 ELSE 0 END
+    ) AS INT64) AS chronic_severe_organ,
+    electivesurgery AS elective_surgery
+  FROM `physionet-data.eicu_crd.apachepredvar`
+),
+
+admission AS (
+  SELECT
+    p.patientunitstayid AS stay_id,
+    CASE
+      WHEN LOWER(p.apacheadmissiondx) LIKE '%surgery%'
+        OR LOWER(p.apacheadmissiondx) LIKE '%surgical%'
+        OR LOWER(p.apacheadmissiondx) LIKE '%post-op%'
+        OR LOWER(p.apacheadmissiondx) LIKE '%postop%'
+        OR pr.elective_surgery = 1
+      THEN CASE WHEN pr.elective_surgery = 1
+                THEN 'elective_postop' ELSE 'emergency_postop' END
+      ELSE 'nonoperative'
+    END AS admission_class
+  FROM `physionet-data.eicu_crd.patient` p
+  LEFT JOIN pred pr ON p.patientunitstayid = pr.stay_id
+),
+
+dialysis AS (
+  SELECT stay_id, 1 AS dialysis
+  FROM `eicu-ext.eicu_ext_data.v2_intervention_features_eicu`
+  WHERE intervention = 'rrt' AND ever_active = 1
+),
+
+-- ---------------------------------------------------------------------
+-- BLOCK 8 (SOFA). The three intervention inputs SOFA needs and APACHE
+-- does not. VERBATIM from the MIMIC file apart from the table name; see
+-- its block 8 for why `dx_nee_peak` is read here despite the formula
+-- guard, and why the two ventilation flags are kept separate.
+--
+-- There is no BLOCK 7 in this file. That is the native-SOFA join, and
+-- eICU has no SOFA to join. The numbering is kept aligned with the MIMIC
+-- file so the two can be read side by side.
+-- ---------------------------------------------------------------------
+sofa_intv AS (
+  SELECT
+    stay_id,
+    CAST(MAX(IF(intervention = 'invasive_vent',    ever_active, 0)) AS INT64) AS vent_inv,
+    CAST(MAX(IF(intervention = 'noninvasive_vent', ever_active, 0)) AS INT64) AS vent_niv,
+    CAST(MAX(IF(intervention = 'inotrope',         ever_active, 0)) AS INT64) AS inotrope,
+    -- MEASURED 2026-08-30: 5,218 of eICU's 13,430 vasopressor stays (38.9%)
+    -- have `ever_active = 1` and a NULL `dx_nee_peak`, because eICU's dose
+    -- lives in free-text `infusiondrug.drugrate` and does not always parse.
+    -- Without this flag those stays are indistinguishable from stays that
+    -- never received a pressor, and R/09d would score them on the MAP tier
+    -- alone -- silently weakening eICU's SOFA cardiovascular component, which
+    -- is the exact component the SOFA arm exists to compare. The flag lets
+    -- .sofa_cardio() floor them at tier 3 instead.
+    CAST(MAX(IF(intervention = 'vasopressor',      ever_active, 0)) AS INT64) AS vaso_active,
+    -- PLAUSIBILITY GUARD, in the same spirit as signal_spec and added for the
+    -- same reason. MEASURED 2026-08-30: the maximum norepinephrine equivalent
+    -- is 94.7 at MIMIC and 123.1 at eICU, where anything above roughly 2
+    -- mcg/kg/min is already extreme. The medians are sensible (0.285 in
+    -- SOFA's top native tier), so this is an outlier tail rather than a unit
+    -- error -- but SOFA's cardiovascular tiers are dose THRESHOLDS, so a
+    -- single artifact maxes the component out. 5.0 is generous: it is well
+    -- above any defensible clinical ceiling and still removes the impossible
+    -- values. Out-of-range doses become NULL, and `vaso_active` then floors
+    -- the stay at tier 3 rather than dropping it to the MAP tier.
+    MAX(IF(intervention = 'vasopressor'
+           AND dx_nee_peak > 0 AND dx_nee_peak <= 5.0, dx_nee_peak, NULL))    AS nee_peak
+  FROM `eicu-ext.eicu_ext_data.v2_intervention_features_eicu`
+  GROUP BY stay_id
+)
+
+SELECT
+  c.stay_id,
+
+  -- --- native score --------------------------------------------------
+  n.aps_native                                 AS aps_native,
+  COALESCE(n.aps_native_version, 'apache_none') AS aps_native_version,
+  n.aps_native_prob                            AS aps_native_prob,
+  n.severity_total_native                      AS severity_total_native,
+
+  -- --- APACHE II physiologic inputs, worst-in-first-24h -------------
+  o.temp_min                                   AS ap2_temp_min,
+  o.temp_max                                   AS ap2_temp_max,
+  o.mbp_min                                    AS ap2_mbp_min,
+  o.mbp_max                                    AS ap2_mbp_max,
+  o.hr_min_v                                   AS ap2_hr_min,
+  o.hr_max_v                                   AS ap2_hr_max,
+  o.rr_min                                     AS ap2_rr_min,
+  o.rr_max                                     AS ap2_rr_max,
+  v.pao2_v                                     AS ap2_pao2,
+  v.paco2_v                                    AS ap2_paco2,
+  v.fio2_v                                     AS ap2_fio2,
+  v.pf_v                                       AS ap2_pf_min,
+  -- ONE value, written into both ends. See SITE SUBSTITUTIONS.
+  v.ph_v                                       AS ap2_ph_min,
+  v.ph_v                                       AS ap2_ph_max,
+  o.hco3_min                                   AS ap2_hco3_min,
+  o.hco3_max                                   AS ap2_hco3_max,
+  o.na_min                                     AS ap2_sodium_min,
+  o.na_max                                     AS ap2_sodium_max,
+  k.k_min                                      AS ap2_potassium_min,
+  k.k_max                                      AS ap2_potassium_max,
+  o.creat_min                                  AS ap2_creatinine_min,
+  o.creat_max                                  AS ap2_creatinine_max,
+  v.hct_v                                      AS ap2_hematocrit_min,
+  v.hct_v                                      AS ap2_hematocrit_max,
+  o.wbc_min                                    AS ap2_wbc_min,
+  o.wbc_max                                    AS ap2_wbc_max,
+  gn.gcs_min_native                            AS ap2_gcs_min_native,
+  go.gcs_min_ours                              AS ap2_gcs_min_ours,
+  go.gcs_min_ours_vnorm                        AS ap2_gcs_min_ours_vnorm,
+
+  -- --- acute renal failure inputs ------------------------------------
+  CAST(o.uo_rate_sum * c.weight_kg AS FLOAT64) AS ap2_urine_ml_24h,
+  CAST(COALESCE(d.dialysis, 0) AS INT64)       AS ap2_dialysis,
+
+  -- --- chronic health and admission type (SECONDARY) -----------------
+  COALESCE(pr.chronic_immunocompromised, 0)    AS chronic_immunocompromised,
+  COALESCE(pr.chronic_severe_organ, 0)         AS chronic_severe_organ,
+  COALESCE(a.admission_class, 'nonoperative')  AS admission_class,
+
+  -- --- provenance and coverage ---------------------------------------
+  'apacheapsvar+lab'                           AS ap2_gap_source,
+
+  CAST(
+    (CASE WHEN o.temp_min  IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN o.mbp_min   IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN o.hr_min_v  IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN o.rr_min    IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN v.pao2_v    IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN v.ph_v IS NOT NULL OR o.hco3_min IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN o.na_min    IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN k.k_min     IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN o.creat_min IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN v.hct_v     IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN o.wbc_min   IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN gn.gcs_min_native IS NOT NULL THEN 1 ELSE 0 END)
+  AS INT64)                                    AS ap2_n_vars_present,
+
+  -- --- SOFA: the native score, per organ ----------------------------
+  -- STRUCTURALLY NULL AT eICU. eICU ships no SOFA of any kind. Typed
+  -- NULLs so the column set matches MIMIC, where the derived concept
+  -- validates our recomputation. Never modelled at either site; the
+  -- recomputed SOFA is what transports.
+  CAST(NULL AS INT64)                          AS sofa_native,
+  CAST(NULL AS INT64)                          AS sofa_native_respiration,
+  CAST(NULL AS INT64)                          AS sofa_native_coagulation,
+  CAST(NULL AS INT64)                          AS sofa_native_liver,
+  CAST(NULL AS INT64)                          AS sofa_native_cardiovascular,
+  CAST(NULL AS INT64)                          AS sofa_native_cns,
+  CAST(NULL AS INT64)                          AS sofa_native_renal,
+
+  -- --- SOFA: the recomputation's inputs -----------------------------
+  -- VERBATIM from MIMIC. Respiration reuses `ap2_pao2` / `ap2_fio2`,
+  -- which at eICU come from `apacheApsVar` and are therefore APACHE IV's
+  -- worst values rather than a coherent single gas. That approximation is
+  -- already documented in SITE SUBSTITUTIONS and it now affects the SOFA
+  -- respiration component as well as APACHE's oxygenation one. It is the
+  -- same numbers in both, so it cannot make the two arms disagree with
+  -- each other; it can make both differ from MIMIC.
+  o.plt_min                                    AS sofa_platelet_min,
+  o.bili_max                                   AS sofa_bilirubin_max,
+  COALESCE(si.vent_inv, 0)                     AS sofa_vent_invasive,
+  COALESCE(si.vent_niv, 0)                     AS sofa_vent_noninvasive,
+  COALESCE(si.vaso_active, 0)                  AS sofa_vasopressor,
+  si.nee_peak                                  AS sofa_nee_peak,
+  COALESCE(si.inotrope, 0)                     AS sofa_inotrope,
+
+  CAST(
+    (CASE WHEN v.pf_v IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN o.plt_min         IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN o.bili_max        IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN o.mbp_min IS NOT NULL OR si.vaso_active = 1
+               OR si.inotrope = 1 THEN 1 ELSE 0 END) +
+    (CASE WHEN gn.gcs_min_native IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN o.creat_max IS NOT NULL OR o.uo_rate_sum IS NOT NULL THEN 1 ELSE 0 END)
+  AS INT64)                                    AS sofa_n_organs_present
+
+FROM cohort c
+LEFT JOIN native     n  ON c.stay_id = n.stay_id
+LEFT JOIN ours       o  ON c.stay_id = o.stay_id
+LEFT JOIN gcs_native gn ON c.stay_id = gn.stay_id
+LEFT JOIN gcs_ours   go ON c.stay_id = go.stay_id
+LEFT JOIN apsvar     v  ON c.stay_id = v.stay_id
+LEFT JOIN potassium  k  ON c.stay_id = k.stay_id
+LEFT JOIN pred       pr ON c.stay_id = pr.stay_id
+LEFT JOIN admission  a  ON c.stay_id = a.stay_id
+LEFT JOIN dialysis   d  ON c.stay_id = d.stay_id
+LEFT JOIN sofa_intv  si ON c.stay_id = si.stay_id;
+
+
+-- =====================================================================
+-- AUDITS - run these, do not skip. Aggregates only.
+-- =====================================================================
+-- A1. THE DE-DUPLICATION CHECK. n MUST equal n_distinct and MUST equal
+--     the cohort count. If it does not, the apachePatientResult version
+--     handling is wrong and every downstream number is computed on a
+--     silently reweighted cohort.
+-- SELECT COUNT(*) AS n, COUNT(DISTINCT stay_id) AS n_distinct
+-- FROM `...v2_severity_eicu`;
+--
+-- A2. Which APACHE version each stay actually got, and how many got none.
+-- SELECT aps_native_version, COUNT(*) FROM `...v2_severity_eicu` GROUP BY 1;
+--
+-- A3. THE SENTINEL CHECK. Nothing may survive at -1. A negative minimum
+--     in any of these columns means a -1 guard was missed and the
+--     baseline is corrupted.
+-- SELECT MIN(ap2_ph_min), MIN(ap2_pao2), MIN(ap2_paco2), MIN(ap2_fio2),
+--        MIN(ap2_hematocrit_min), MIN(ap2_potassium_min), MIN(aps_native),
+--        MIN(aps_native_prob), MIN(severity_total_native)
+-- FROM `...v2_severity_eicu`;
+--
+-- A4. Coverage, against MIMIC's A1. Report both; a thinner APACHE II at
+--     one site is a weaker APACHE II at that site and must be stated
+--     beside any cross-site gap.
+-- SELECT COUNT(*) AS n,
+--        AVG(ap2_n_vars_present)           AS mean_vars,
+--        COUNTIF(ap2_n_vars_present >= 10) AS n_ge_10,
+--        COUNTIF(ap2_n_vars_present < 8)   AS n_thin,
+--        COUNTIF(ap2_pao2 IS NOT NULL) / COUNT(*)          AS frac_with_abg,
+--        COUNTIF(ap2_potassium_min IS NOT NULL) / COUNT(*) AS frac_with_k
+-- FROM `...v2_severity_eicu`;
+--
+-- A5. The GCS pair. Unlike MIMIC, these should agree closely, because
+--     eICU never masks verbal. A large gap here means the hourly GCS
+--     coverage is the cause, not the masking, and that is a different
+--     finding.
+-- SELECT COUNTIF(ap2_gcs_min_native != ap2_gcs_min_ours) AS n_differ,
+--        AVG(ap2_gcs_min_native - ap2_gcs_min_ours)      AS mean_gap,
+--        COUNT(*) AS n
+-- FROM `...v2_severity_eicu`
+-- WHERE ap2_gcs_min_native IS NOT NULL AND ap2_gcs_min_ours IS NOT NULL;
+--
+-- A6. Admission class distribution, against MIMIC's A6. The two
+--     constructions are different (elective flag here, care-unit proxy
+--     there), so a distributional difference is expected and is NOT
+--     evidence of case-mix difference. Report the constructions, not just
+--     the split.
+-- SELECT admission_class, COUNT(*), AVG(chronic_severe_organ)
+-- FROM `...v2_severity_eicu` GROUP BY 1;
+--
+-- --- SOFA audits -----------------------------------------------------
+--
+-- A3b. P/F coverage and level, against MIMIC's A3b. eICU's ratio is built
+--      from two independently-selected worst values, so it is a LOWER
+--      bound on the true worst ratio and eICU's SOFA respiration will run
+--      slightly high relative to MIMIC's. Size it before reporting.
+-- SELECT COUNTIF(ap2_pf_min IS NOT NULL) / COUNT(*) AS frac_with_pf,
+--        APPROX_QUANTILES(ap2_pf_min, 4) AS pf_quartiles
+-- FROM `...v2_severity_eicu`;
+--
+-- A9. SOFA input coverage, against MIMIC's A9. THIS IS THE ONE THAT
+--     MATTERS at eICU, because there is no native SOFA to fall back on
+--     and no way to notice a thin recomputation from the score itself.
+--     A materially lower mean_organs than MIMIC means the eICU SOFA is a
+--     weaker score, and any cross-site difference in the SOFA arm is
+--     partly that rather than transportability.
+-- SELECT AVG(sofa_n_organs_present) AS mean_organs,
+--        COUNTIF(sofa_n_organs_present = 6) AS n_complete,
+--        COUNTIF(sofa_platelet_min IS NOT NULL) / COUNT(*)  AS frac_plt,
+--        COUNTIF(sofa_bilirubin_max IS NOT NULL) / COUNT(*) AS frac_bili,
+--        AVG(sofa_vent_invasive) AS frac_vent_inv,
+--        AVG(sofa_vent_noninvasive) AS frac_vent_niv,
+--        COUNTIF(sofa_nee_peak IS NOT NULL) / COUNT(*) AS frac_on_pressor,
+--        AVG(sofa_inotrope) AS frac_inotrope
+-- FROM `...v2_severity_eicu`;
+--
+-- A12. THE VENTILATION FRACTION, read against the frozen decision in
+--      CLAUDE.md. `invasive_vent__exposure_frac` is exactly 1.0 for 90.5%
+--      of ventilated eICU stays because `respiratorycare` does not encode
+--      extubation. That defect is about DURATION, and SOFA uses only the
+--      binary support flag, so it does not propagate here — but the
+--      ventilated FRACTION still has to be compared against MIMIC's
+--      41.6%, because SOFA respiration scores of 3 and 4 are gated on it
+--      and a site difference in the gate is a site difference in the
+--      baseline.
+-- SELECT AVG(sofa_vent_invasive) AS frac_inv,
+--        AVG(GREATEST(sofa_vent_invasive, sofa_vent_noninvasive)) AS frac_any
+-- FROM `...v2_severity_eicu`;
+--
+-- A13. Vasopressor dose coverage. `dx_nee_peak` is the input to SOFA's
+--      cardiovascular tiers 3 and 4, and CLAUDE.md records that the
+--      distinct-molecule counting rule differs between sites. A stay that
+--      is `ever_active` on vasopressor but has a NULL NEE scores 1 rather
+--      than 3 or 4, which silently softens the baseline.
+-- SELECT COUNTIF(sofa_nee_peak IS NULL) AS n_null_nee,
+--        COUNT(*) AS n,
+--        APPROX_QUANTILES(sofa_nee_peak, 10) AS nee_deciles
+-- FROM `...v2_severity_eicu`;
