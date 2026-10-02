@@ -36,6 +36,15 @@ argument for each principle.
    imputed nor modeled.
 7. **Risk is reported against a reference population,** as the observed mortality of a frozen stratum of the score.
 
+## Reading one patient
+
+The patient card presents one stay through the frozen models: the composite score with its band and reference stratum, and each
+channel's evidence with its uncertainty. The card below is a high-risk stay from the openly licensed eICU-CRD demo (Open Database
+License). A dagger marks the temperature channel, two of whose terms lie outside the support of the training data, so that its
+evidence rests on extrapolation of the fitted functions and carries a wide band.
+
+![High-risk patient card](paper/figs/F14_patient_card_high.png)
+
 ## Key results
 
 **Discrimination and transport.** The evidence sums held their discrimination at eICU better than gradient-boosted trees. The joint
@@ -82,15 +91,6 @@ When the leading channel changed under resampling, it usually moved by one rank,
 Between the two families, the leading channel of one model often sat far down the ranking of the other.
 
 ![Rank displacement between the joint model and SHAP](paper/figs/F12_rank_displacement_shap.png)
-
-## Reading one patient
-
-The patient card presents one stay through the frozen models: the composite score with its band and reference stratum, and each
-channel's evidence with its uncertainty. The card below is a high-risk stay from the openly licensed eICU-CRD demo (Open Database
-License). A dagger marks the temperature channel, two of whose terms lie outside the support of the training data, so that its
-evidence rests on extrapolation of the fitted functions and carries a wide band.
-
-![High-risk patient card](paper/figs/F14_patient_card_high.png)
 
 ## Implementation and auditability
 
