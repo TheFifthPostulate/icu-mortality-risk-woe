@@ -157,11 +157,14 @@ of record. A rerun therefore updates those entries as it goes, and the table bel
 | `config/attribution_eval.yml` (142–144) `gate.*` | three older reference runs | needed only for `tests/attr_metrics.R --gate`, a code-equivalence check |
 | `config/attribution_eval.yml` (172) `ladder.run` | `""` | keep empty, so that the generator refits |
 | `tests/attr_bands.R` (38) default `--store` | `attrgen_20260909T115047` | step 8 (or pass `--store`) |
+| `tests/attr_external_bags.R` (88) default `--internal` | `attrgen_20260909T115047` | step 8, the MIMIC-IV generator (or pass `--internal`) |
+| `tests/attr_transport_join.R` (32) default `--mimic` | `attrmetrics_20260909T165755` | step 8, the MIMIC-IV metrics (or pass `--mimic`) |
+| `tests/attr_collapse_unmeasured.R` (47–49) defaults `--eicu`, `--mimic`, `--hosp` | `attrextgen_20261006T082355`, `attrgen_20260909T115047`, `attrhosp_20261006T133213` | step 8, the eICU arm (or pass all three) |
 | `run/patient_card.R` (78) default `--qc-run` | `gamqc_20260909T180107` | step 8, the second `gam_qc` pass (or pass `--qc-run`) |
 | `paper/make_anchored_curves.R` (19) | `gamqc_20260909T180107` | step 8, the second `gam_qc` pass |
 | `paper/make_atlas.R` (24) | `gamqc_20260909T180107` | step 8, the second `gam_qc` pass |
 | `paper/make_card_figure.R` (15) | `gamqc_20260909T180107` | step 8, the second `gam_qc` pass |
-| `paper/make_figures.R` (13–18) | internal, test, external, attrmetrics, attrext and gamqc runs | steps 4, 6, 7 and 8 |
+| `paper/make_figures.R` (13–22) | internal, test, external, attrmetrics, attrext, attrmetricsext and gamqc runs | steps 4, 6, 7 and 8 |
 | `paper/make_signal_auroc_meas.R` (`REF`) | `internal_20260909T112643` | step 4 |
 
 Several older scripts under `tests/` (for example `attribution_margin.R`, `attribution_ties.R`, `coupling_*.R`) also name earlier runs.
@@ -211,7 +214,8 @@ We did this step by hand, and `demo/eicu_demo/convert_to_parquet.R` shows the co
 ### The analytical pipeline
 
 On our machine, a Windows laptop with R 4.5.2, the steps from here to the end of the attribution analysis took about 8 hours, with the
-concurvity null running alongside the other steps, and about 12 hours when run one after another.
+concurvity null running alongside the other steps, and about 12 hours when run one after another. The eICU reproducibility arm of step 8
+adds about 3.5 hours.
 
 ### 3. Checks before fitting (seconds)
 
@@ -248,15 +252,40 @@ We scored the held-out test set once, after the design of the study was frozen, 
 
 `Rscript run/external.R` (`--no-hospital` for the pooled analysis only)
 
-### 8. Attribution and reproducibility (about 6.5 hours)
+### 8. Attribution and reproducibility (about 10 hours)
+
+**MIMIC-IV (about 6.5 hours).**
 
 1. `Rscript tests/attr_replicates.R --check-specs` (seconds)
 2. `Rscript tests/attr_replicates.R --levels spec,seed,sample` (about 5 hours; resumable with `--resume out/runs/attrgen_<time>`)
 3. `Rscript tests/attr_metrics.R out/runs/attrgen_<time>` (about 1 hour)
 4. `Rscript tests/attr_bands.R --store out/runs/attrgen_<time> --bundle <bundle>` (8 minutes)
-5. `Rscript tests/attr_external.R --mimic out/runs/attrmetrics_<time>` (2 minutes)
+5. `Rscript tests/attr_external.R --mimic out/runs/attrmetrics_<time>` (2 minutes), the frozen bundle applied once at eICU, which the
+   eICU arm below also holds as its anchor
 6. Set `concurvity_null` and `attrgen` in `config/gam_qc.yml`, then `Rscript tests/gam_qc.R --external out/runs/external_<time>`
    (about 25 minutes)
+
+**eICU (about 3.5 hours).** The three attribution methods of the paper (the measurement and paired weights of evidence, and SHAP of the
+constructed booster) are refitted whole, without folds, on the same 38 bags as the MIMIC-IV generator, with the random-variable parameters
+held at their final values, and each refit is applied to the eICU cohort. The metrics are then computed exactly as at MIMIC-IV. Nothing is
+fitted on eICU outcomes, no model is saved, and no target is invalidated. Run the steps one after another; R's peak memory was below 3 GB.
+
+1. `Rscript tests/attr_external_bags.R --plan-only --internal out/runs/attrgen_<time>` (seconds): checks that the bags match the MIMIC-IV
+   store and prints the planned replicates
+2. `Rscript tests/attr_external_bags.R --verify-anchor --internal out/runs/attrgen_<time>` (about 2 hours 15 minutes; resumable with
+   `--resume out/runs/attrextgen_<time>`). `--verify-anchor` first refits every evidence model and the booster on the whole training set,
+   and stops unless they reproduce the frozen bundle at eICU.
+3. `Rscript tests/attr_metrics.R --site eicu out/runs/attrextgen_<time>` (about 45 minutes), which writes `out/runs/attrmetricsext_<time>/`
+4. `Rscript tests/attr_bands.R --store out/runs/attrextgen_<time> --methods llr_full,llr_meas` (about 13 minutes); the bundle is read from
+   the store
+5. `Rscript tests/attr_transport_join.R --mimic out/runs/attrmetrics_<time> --eicu out/runs/attrmetricsext_<time>` (seconds), which sets
+   every eICU table beside its MIMIC-IV counterpart
+6. `Rscript tests/attr_hospital_disagreement.R --store out/runs/attrextgen_<time> --metrics out/runs/attrmetricsext_<time>` (about 18
+   minutes), the same metrics within each eICU hospital that meets the inclusion floors
+7. `Rscript tests/attr_collapse_unmeasured.R --eicu out/runs/attrextgen_<time> --mimic out/runs/attrgen_<time> --hosp
+   out/runs/attrhosp_<time>` (under a minute), the SHAP-leader collapse split by measured and unmeasured leaders
+
+If their eICU run options are left out, steps 5 and 6 read the latest complete `attrextgen` and `attrmetricsext` runs.
 
 The evaluation library `R/14_attribution_eval.R` is loaded by these scripts, and it is not run on its own.
 
