@@ -10,6 +10,13 @@
 % files written by one script and read by another and are declared, not
 % checked. Where a real call would have to cross a row it is stated in the
 % consumer's inner-call line instead, with the box number of the callee.
+% Stage 6, the eICU reproducibility arm (attribution plan Part Seven), is the
+% separate chart pipeline_attribution_eicu.tex (2026-10-06); its boxes are
+% referred to here by number (6.11 is its store). The checker takes the
+% coverage of the attribution arm over both files. Stage 5's patient card was
+% redrawn the same day from the tables after run/patient_card.R gained the
+% profile selection, the reference percentiles, the extrapolation flag and the
+% anchored term decomposition of R/15_anchors.R, which this arm now owns.
 % R/13b_attribution_floor.R is excluded (the old floor, not re-run); R/13 is
 % present only through attribution_ranking(), which the gate imports.
 % `python docs/figs/callgraph_check.py attribution` holds this chart to the
@@ -19,7 +26,7 @@
 %
 % Build:  pdflatex pipeline_attribution.tex   (from this directory)
 \documentclass[10pt]{article}
-\usepackage[paperwidth=44cm,paperheight=70cm,margin=8mm]{geometry}
+\usepackage[paperwidth=44cm,paperheight=74cm,margin=8mm]{geometry}
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
 \usepackage{amsmath}
@@ -85,7 +92,7 @@
 
 \node[outp] (gen) at (3.4,-18.4) {\Obj{2.6}{out/runs/attrgen\_*}{replicates/*.qs2 from 2.1 to 2.5; manifest\_replicates.csv, tombstones and coverage from 1.8; measured.qs2; the fingerprint stamp}};
 \node[note] (n3) at (10.2,-18.4) {Routes per family. Evidence arms: ladder, bootstrap (40 bags), posterior (40 draws). SHAP: ladder, bootstrap (40), seed (8), bootstrap\_seeded (40). All five boxes run inside one loop statement of the script over methods, routes and bags, which is why no arrow orders them.};
-\node[note] (n4) at (17.0,-18.4) {In a bag refit the folds and the parameters of the random variables are held fixed and only the evidence models are refitted. A bag on which any specification fails is excluded whole (1.7): two of forty were.};
+\node[note] (n4) at (17.0,-18.4) {In a bag refit, each fold's model is fitted on the bag's stays from the other four folds and scores the whole held-out fold, in the bag or not. The folds, the parameters of the random variables and the reference rates are held fixed, and only the models are refitted. A bag on which any specification fails is excluded whole (1.7): two of forty were.};
 \node[note] (n5) at (30.6,-18.4) {The bootstrap route is primary for the evidence arms; the posterior route is the cheap companion with a different estimand, and the two are never pooled.};
 
 % the store serves every route (1.5 -> 2.x): a bus below stage 1
@@ -150,7 +157,7 @@
 \node[fn]  (extl4) at (20.0,-45.6) {\B{4.4}{Level 4 at eICU: specification on identical eICU rows}{attr\_agree\_k(), attr\_sign\_flip(), attr\_cosine\_dissim()}{attr\_leader\_patient\_summary() (3.6), attr\_arm\_of()}{R/14\_attribution\_eval.R}};
 \node[fn]  (prov) at (25.4,-45.6) {\B{4.5}{Check that the bundle and the MIMIC-IV metrics run share one design}{transport\_provenance()}{attr\_design\_key() (1.2), attr\_design\_diff(), attr\_key\_hash(), read\_manifest()}{tests/attr\_external.R, R/14}};
 \node[outp] (extout) at (30.4,-45.6) {\Obj{4.6}{out/runs/attrext\_*}{eICU budget, resolution and level-4 tables}};
-\node[note] (n8) at (14.6,-50.0) {No bags at eICU: the site is attributed once. Cross-site readings are distributional, the eICU level-4 value read against the MIMIC-IV bag distribution of the same contrast.};
+\node[note] (n8) at (14.6,-50.0) {The frozen bundle attributes eICU once: the eICU level-4 value is read against the MIMIC-IV bag distribution of the same contrast. The variability of the fitting procedure at eICU is measured in stage 6 (the eICU chart), by refitting on the internal bags and applying each refit here.};
 
 \draw[e] (ext) -- (A); \draw[e] (A) -- (extl1);
 \draw[e] (A.south) -- ++(0,-1.5) -| (extl4.south);
@@ -164,21 +171,29 @@
 % =====================================================================
 % STAGE 5: bands and the patient card
 % =====================================================================
-\node[obj] (bandsin) at (2.8,-55.6) {\Obj{5.1}{mf, measured, bundle}{the manifest and the measured mask read from the attrgen directory (STORE) and the bundle (BUNDLE), both named on the command line}};
+\node[obj] (bandsin) at (2.8,-55.6) {\Obj{5.1}{mf, measured, bundle}{the manifest and the measured mask read from the attrgen directory (STORE), or at eICU the attrextgen directory (6.11, the eICU chart), and the bundle (BUNDLE), both named on the command line}};
 \node[fnw] (bands) at (8.8,-55.6) {\B{5.2}{Per-patient 95 percent bands from the store}{band\_of()}{rd() reads the ladder anchor, the posterior and the bootstrap replicates of llr\_full, llr\_meas, llr\_cond; keys(); 2.5th and 97.5th percentiles per signal and on the sum; widths on measured cells; bin\_of() on the frozen cut points}{tests/attr\_bands.R}};
 \node[outp] (bandsout) at (14.4,-55.6) {\Obj{5.3}{out/runs/attrbands\_*}{band widths per signal and on the sum, per method and route}};
-\node[obj] (cardin) at (19.6,-55.6) {\Obj{5.4}{bundle\_path, STAY, SEED, B}{one stay, a seed and the draw count, from the command line}};
-\node[fnw] (card) at (25.8,-55.6) {\B{5.5}{One patient card from the frozen bundle}{pick(), pctl(), bin\_of(), stratum(), strat\_row(), fmt()}{load\_bundle(), bundle\_cfg(), load\_tables(), assign\_folds() (E 7.1, 7.2, 1.3); per final model: priors\_for(final), signal\_frame(predict), lpmatrix, $V_c$, rmvn\_clamped() draws, $L = X_p\beta - \operatorname{logit}\bar p$; pctl() against the reference out-of-fold L; wilson() on the frozen cut points}{run/patient\_card.R}};
-\node[outp] (cardout) at (31.4,-55.6) {\Obj{5.6}{out/runs/card\_*}{one stay's card as a file; console prints structure only}};
-\node[note] (n9) at (25.8,-60.4) {The card is the posterior route of 2.5 applied at one stay. An unmeasured signal is zero with a zero-width band.};
+\node[obj] (cardin) at (19.6,-55.6) {\Obj{5.4}{bundle\_path, SITE, STAY, SEED, B, TERMS\_SIGNALS, PROFILE\_MODE}{the bundle, the site (MIMIC-IV test, eICU or the eICU demo), one stay or --profiles, a seed, the draw count and the signals whose terms are split, from the command line}};
+\node[fnw] (card) at (25.8,-55.6) {\B{5.5}{One patient card from the frozen bundle}{make\_card(), write\_card()}{load\_bundle(), bundle\_cfg(), load\_tables(), assign\_folds() (E 7.1, 7.2, 1.3); per final model of a measured signal (layer1\_jobs()): priors\_for(final), signal\_frame(predict), lpmatrix, $V_c$, rmvn\_clamped() draws, $L = X_p\beta - \operatorname{logit}\bar p$; pick() applies the alias rule (full\_model\_of()); the band of the sum from the summed draws; the references of 5.7; for each terms signal the anchored terms of 5.9, stopping unless they reproduce $L$ within 1e-8; fmt(); write\_card() writes the card and its tables}{run/patient\_card.R}};
+\node[outp] (cardout) at (31.4,-55.6) {\Obj{5.6}{out/runs/card\_*}{one card, or three under --profiles, as files: card.txt and the per-signal, summary and terms tables; the channel reference quantiles; the console prints structure only}};
+
+\node[note] (n9) at (13.6,-62.6) {The card is the posterior route of 2.5 applied at one stay. An unmeasured signal is zero with a zero-width band. Percentiles say how unusual a value is for its channel and are never summed.};
+\node[fn]  (cref) at (19.6,-62.6) {\B{5.7}{The frozen references a card is read against}{pctl(), bin\_of(), stratum(), strat\_row(), outside\_support()}{the reference run's 20-bin mortality table, its out-of-fold $L$ of measured stays per channel and its llr\_sum; the bundle's 21 cut points; wilson() intervals; the QC run's support grid (at least 50 stays and 5 deaths in a 5 percent window) for the EXTRAPOLATED flag}{run/patient\_card.R}};
+\node[fn]  (canc) at (25.8,-62.6) {\B{5.9}{Anchor each term at a quiet day on the channel}{term\_anchor(), reference\_evidence(), .smooth\_rows()}{$f^*(x) = f(x) - f(x_0)$; $L_{\text{ref}}$ = intercept $+ \sum f(x_0) - \operatorname{logit}\bar p$, so $L = L_{\text{ref}} + \sum f^*$; the propensity anchors at the channel's typical charting hours (the anchor table), every other variable at 0; presentation only, nothing fitted, nothing enters a score}{R/15\_anchors.R}};
+\node[fn]  (cpool) at (31.4,-62.6) {\B{5.8}{--profiles: three stays chosen by the frozen score, one per reference-risk profile}{score\_pool()}{full\_model\_of(); signal\_frame(predict) and the final GAMs' link predictions over the pool; bin\_of() (5.7); quartile 1, quartiles 2-3, quartile 4; with\_seed() draw among stays with the terms signals measured; pool score and card score must agree within 1e-6; the outcome never chooses}{run/patient\_card.R}};
 
 \draw[e] (bandsin) -- (bands); \draw[ex] (bands) -- (bandsout);
 \draw[e] (cardin) -- (card); \draw[ex] (card) -- (cardout);
-\draw[en] (card.south) -- (n9.north);
+\draw[e] (cref.north) |- ($(card.south)+(-2.4,-0.6)$) -- ($(card.south)+(-2.4,0)$);
+\draw[e] (canc) -- (card);
+\draw[e] (cpool.north) |- ($(card.south)+(2.4,-0.6)$) -- ($(card.south)+(2.4,0)$);
+
 \draw[ex] (gen.west) -- (-0.4,-18.4) -- (-0.4,-55.6) -- (bandsin.west) node[al, pos=0.5, anchor=west, rotate=90] {~the store is read again};
 
 \begin{scope}[on background layer]
-\node[grp, fit=(bandsin)(bands)(bandsout)(cardin)(card)(cardout)(n9), label={[lab]north:{5. Bands (tests/attr\_bands.R) and the patient card (run/patient\_card.R)}}] (b5) {};
+\node[grp, fit=(bandsin)(bands)(bandsout)(cardin)(card)(cardout)(n9)(cref)(canc)(cpool), label={[lab]north:{5. Bands (tests/attr\_bands.R) and the patient card (run/patient\_card.R)}}] (b5) {};
 \end{scope}
+
 \end{tikzpicture}
 \end{document}
