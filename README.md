@@ -102,7 +102,7 @@ the stored objects and the file each function lives in. We hold each chart to th
 ![Evidence-model engine](paper/figs/chart_engine.png)
 
 Other charts: [gradient-boosted comparators](paper/figs/chart_boosters.pdf) ·
-[severity baselines](paper/figs/chart_severity.pdf) · [attribution](paper/figs/chart_attribution.pdf)
+[severity baselines](paper/figs/chart_severity.pdf) · [attribution](paper/figs/chart_attribution.pdf) · [attribution external](paper/figs/chart_attribution_eicu.pdf)
 
 ## Data access and use of large language models
 
