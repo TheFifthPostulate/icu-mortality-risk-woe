@@ -85,7 +85,14 @@ for (f in sort(list.files("R", pattern = "[.]R$", full.names = TRUE))) source(f)
 
 args <- commandArgs(trailingOnly = TRUE)
 GATE <- "--gate" %in% args
-pos  <- args[!grepl("^--", args)]
+# --site eicu (added 2026-10-06, paper/plans/plan_eicu_reproducibility_arm.md):
+# consume an eICU whole-bag store from tests/attr_external_bags.R. Only the
+# guard block, the method set, the run prefix, the site label and the selection
+# rule differ; every metric and contrast below is the same code.
+.si  <- which(args == "--site")
+SITE <- if (length(.si) && .si[1] < length(args)) args[.si[1] + 1L] else "mimic"
+if (!SITE %in% c("mimic", "eicu")) stop("--site must be mimic or eicu", call. = FALSE)
+pos  <- args[!grepl("^--", args) & !(seq_along(args) %in% (.si + 1L))]
 ecfg <- yaml::read_yaml("config/attribution_eval.yml")
 
 # ============================================================================
@@ -424,7 +431,8 @@ if (GATE) {
 
 ALLOW_INCOMPLETE <- "--allow-incomplete" %in% args
 ALLOW_PARTIAL    <- "--allow-partial" %in% args
-gen_d <- if (length(pos)) pos[1] else latest_run("attrgen", require_complete = TRUE)
+gen_d <- if (length(pos)) pos[1] else
+  latest_run(if (SITE == "mimic") "attrgen" else "attrextgen", require_complete = TRUE)
 if (is.null(gen_d) || !dir.exists(gen_d)) {
   stop("no COMPLETE attrgen run to consume. Run `Rscript tests/attr_replicates.R` ",
        "first, or pass a run directory (add --allow-incomplete for one whose ",
@@ -448,13 +456,25 @@ if (is.null(.gm) || !identical(.gm$status, "complete")) {
 }
 STORE_STATUS <- if (identical(.gm$status, "complete")) "complete" else "incomplete"
 
+if (SITE == "mimic") {
 cfg     <- tar_read(cfg)
 folds   <- tar_read(folds)
 tr      <- tar_read(train_ids)
 priors  <- tar_read(priors)
+ids_ch  <- as.character(tr)
+} else {
+  # THE eICU STORE CARRIES ITS OWN DESIGN: the frozen bundle it applied, the
+  # eICU rows, and the internal store whose bags it mirrors. The design comes
+  # from the bundle, never from config/config.yml (as at every apply site).
+  source("tests/attr_external_common.R")
+  .dg_e  <- qs2::qs_read(file.path(gen_d, "design.qs2"))
+  xcfg   <- yaml::read_yaml("config/external.yml")
+  bundle <- load_bundle(.dg_e$bundle, verbose = FALSE)
+  cfg    <- bundle_cfg(bundle, paths = cfg_req(xcfg, "paths"))
+  ids_ch <- as.character(.dg_e$stay_id)
+}
 domains <- load_domains("config/domains.csv")
 sigs    <- as.character(unlist(cfg$signals))
-ids_ch  <- as.character(tr)
 
 man  <- utils::read.csv(file.path(gen_d, "manifest_replicates.csv"),
                         stringsAsFactors = FALSE)
@@ -477,6 +497,7 @@ sub  <- cfg_req(ecfg, "storage", "subdir")
 # settings, the design subset of config.yml, the priors, the generator's
 # seeds, draw count and draw layout -- and the same refusal applies.
 cat("\n=== staleness guard ===\n\n")
+if (SITE == "mimic") {
 .dp <- file.path(gen_d, "design.qs2")
 if (!file.exists(.dp)) {
   stop("the generator run ", basename(gen_d), " carries no design.qs2, so it ",
@@ -543,6 +564,43 @@ if (nrow(.fd)) {
   cat(sprintf("  replicate store fingerprint %s matches the live design.\n",
               attr_key_hash(.fp)))
 }
+} else {
+  # THE eICU GUARD: the store's design key and fingerprint are recomputed from
+  # the bundle, the eICU cohort on disk and the internal store it names, with
+  # the same function its generator used; any difference stops the run.
+  .dg <- .dg_e
+  if (!identical(.dg$site, "eicu") || !identical(.dg$generator, EICU_GEN_VERSION)) {
+    stop("--site eicu: ", basename(gen_d), " is not an eICU whole-bag store (",
+         EICU_GEN_VERSION, ").", call. = FALSE)
+  }
+  .tabs_e <- load_tables(cfg$paths, cfg, site = "eicu", verbose = FALSE)
+  if (!identical(as.character(.tabs_e$cohort$stay_id), ids_ch)) {
+    stop("--site eicu: the eICU cohort on disk is not the store's row set.", call. = FALSE)
+  }
+  # The stored measured mask decides which channels an LLR comparison reads; it
+  # must be the mask of the eICU tables on disk, as the generator checks on resume.
+  if (!identical(measured_matrix(.tabs_e, cfg, .dg$stay_id), meas)) {
+    stop("--site eicu: the store's measured mask differs from the one the eICU ",
+         "tables on disk give.", call. = FALSE)
+  }
+  rm(.tabs_e)
+  .int_dg <- qs2::qs_read(file.path(dirname(gen_d), .dg$internal_store, "design.qs2"))
+  .id <- eicu_store_identity(.int_dg$design_key, bundle, cfg, ecfg, .dg$stay_id, .dg$methods)
+  if (!identical(.id$design_key, .dg$design_key)) {
+    stop("--site eicu: the store's design key differs from the one the bundle, ",
+         "the eICU cohort and the internal store give today.", call. = FALSE)
+  }
+  .fd <- attr_fingerprint_diff(.dg$fingerprint, .id$fingerprint)
+  if (nrow(.fd)) {
+    print(.fd, row.names = FALSE)
+    stop("--site eicu: the store's fingerprint differs from the live design.", call. = FALSE)
+  }
+  .want <- .dg$design_key; .fp <- .id$fingerprint
+  cat(sprintf("  eICU store design key %s and fingerprint %s match the bundle, the\n",
+              attr_key_hash(.want), attr_key_hash(.fp)))
+  cat(sprintf("  eICU cohort (%d stays) and the internal store %s.\n",
+              length(ids_ch), .dg$internal_store))
+}
 
 # THE MANIFEST AND THE MASK (review finding A9): coordinates present, unique
 # and integral; every row the same shape; the mask in the store's row order.
@@ -560,8 +618,10 @@ cat("  manifest carries unique, integral replicate coordinates.\n")
 # as a quietly smaller distribution. A tombstoned bag is accounted for, not
 # missing; anything else absent makes the store PARTIAL, and a partial store
 # is refused unless `--allow-partial` says the reader knows.
-.plan <- attr_replicate_plan(ecfg, n_folds = as.integer(cfg_req(cfg, "n_folds")),
-                             n_pass_fits = 0L)
+.plan <- if (SITE == "mimic")
+  attr_replicate_plan(ecfg, n_folds = as.integer(cfg_req(cfg, "n_folds")),
+                      n_pass_fits = 0L) else
+  eicu_store_plan(ecfg, n_folds = as.integer(cfg_req(cfg, "n_folds")), .dg$methods)
 .tomb_p <- file.path(gen_d, "llr_bootstrap_excluded.csv")
 TOMB_BAGS <- integer(0)
 if (file.exists(.tomb_p)) {
@@ -601,11 +661,39 @@ load_rep <- function(key) {
   M
 }
 
-run <- new_run("attrmetrics", cfg, note = sprintf(
+run <- new_run(if (SITE == "mimic") "attrmetrics" else "attrmetricsext", cfg, note = sprintf(
   "attribution reproducibility hierarchy as DISTRIBUTIONS, replicates from %s, fits nothing",
   basename(gen_d)))
 save_table(run, COV, "replicate_coverage", subdir = "diagnostics")
-save_table(run, ATTR_ESTIMAND_NOTES, "design_notes", subdir = "diagnostics")
+# THE ESTIMAND NOTES TRAVEL WITH THE TABLES. `ATTR_ESTIMAND_NOTES` describes the
+# internal store (out-of-fold priors held fixed, posterior draws from
+# out-of-fold fits); an eICU store holds different things fixed and draws from
+# different fits, so those rows are restated for it.
+NOTES <- ATTR_ESTIMAND_NOTES
+if (SITE == "eicu") {
+  .set <- function(f, v) {
+    if (f %in% NOTES$field) NOTES$value[NOTES$field == f] <<- v
+    else NOTES <<- rbind(NOTES, data.frame(field = f, value = v, stringsAsFactors = FALSE))
+  }
+  .set("in_bag_fraction", paste0(
+    "about 0.632 of training patients per bag (the internal run's bags, membership ",
+    "hashes checked); a whole-bag fit trains on all of them"))
+  .set("held_fixed_under_resampling", paste0(
+    "FINAL bundle priors (alpha, delta, lambda, p_bar), covariate construction, ",
+    "smooth_k; layer-1 GAMs and boosters are refitted on the whole bag and applied to eICU"))
+  .set("level3_estimand", paste0(
+    "sampling variability of a whole-bag layer-1 fit, applied to the eICU cohort, ",
+    "CONDITIONAL on frozen covariate construction"))
+  .set("level3_posterior_estimand", paste0(
+    "posterior draws from each FINAL bundle GAM (Vc), applied to the eICU cohort ",
+    "(contrast L3P): estimation uncertainty conditional on the training sample"))
+  .set("fit_extent", paste0(
+    "whole bag (about 63% of training stays); the internal run's bag refits trained ",
+    "on the bag intersected with four folds (about 50%), so eICU floors are floors ",
+    "of whole-bag fits"))
+  .set("anchor", "the frozen bundle applied once at eICU (coordinate 0,0,0), as tests/attr_external.R")
+}
+save_table(run, NOTES, "design_notes", subdir = "diagnostics")
 
 DELTA_ABS <- as.numeric(cfg_req(ecfg, "delta", "common_absolute"))
 DELTA_REL <- as.numeric(cfg_req(ecfg, "delta", "relative"))
@@ -678,7 +766,8 @@ if (!length(REP1)) stop("no `ladder` replicates in the store: level 1 and every 
 # THE METHOD SET IS THE CONFIGURED ONE, NOT WHATEVER HAPPENS TO BE PRESENT
 # (review finding A9). `intersect(configured, present)` let a method vanish
 # from every comparison without a word.
-SCORE <- as.character(cfg_req(ecfg, "methods"))
+SCORE <- if (SITE == "mimic") as.character(cfg_req(ecfg, "methods")) else
+  as.character(.dg$methods)
 attr_check_methods(SCORE)
 .absent <- setdiff(SCORE, names(REP1))
 if (length(.absent)) {
@@ -1003,7 +1092,7 @@ LC_NAMES <- names(attr_leader_pair_scalars(attr_leader_cells(
 TMP <- file.path(run$path, "tmp_leader_cells")
 dir.create(TMP, showWarnings = FALSE)
 emit_lcd <- function(hdr, pool) {
-  LCD[[length(LCD) + 1L]] <<- cbind(site = "mimic", hdr,
+  LCD[[length(LCD) + 1L]] <<- cbind(site = SITE, hdr,
                                     attr_leader_distribution(pool, COL_SH))
 }
 for (lv in LVLS) {
@@ -1304,7 +1393,7 @@ for (lv in LVLS) for (p in CMP4) {
   if (is.null(REP1[[p[1]]]) || is.null(REP1[[p[2]]])) next
   kp <- keep_pair(p[1], p[2], lv)
   LCD[[length(LCD) + 1L]] <- cbind(
-    site = "mimic",
+    site = SITE,
     data.frame(contrast = "L4", held = "boot=0", method_a = p[1], method_b = p[2],
                agg = lv, route = "refit", n_pairs = 1L, bag_population = "anchor",
                masked = !is.null(kp), stringsAsFactors = FALSE),
@@ -1450,8 +1539,9 @@ cat("    THE STABILITY AXIS IS INTRINSIC: a method's OWN level-3 disagreement\n"
 cat("    distribution on the common bags, at its median and its p95. Read the\n")
 cat("    PROVENANCE block of config/attribution_eval.yml before quoting a\n")
 cat("    verdict: the rule remains EVALUATIVE ONLY.\n\n")
-y_tr <- as.integer(tar_read(y_train))
 SEL <- data.frame(method = SCORE, stringsAsFactors = FALSE)
+if (SITE == "mimic") {
+y_tr <- as.integer(tar_read(y_train))
 
 # THE DISCRIMINATION AXIS READS THE MODEL'S SCORE, NOT THE ATTRIBUTION SUM
 # (review finding A4). For an LLR arm the row sum of its L matrix IS the
@@ -1506,6 +1596,12 @@ for (m in intersect(SCORE, ATTR_SHAP_ARMS)) {
   }
 }
 SEL$auprc_lift <- round(SEL$auprc / mean(y_tr), 4)
+} else {
+  SEL$auroc_attr_sum <- NA_real_; SEL$auprc_attr_sum <- NA_real_
+  SEL$auroc <- NA_real_; SEL$auprc <- NA_real_; SEL$auprc_lift <- NA_real_
+  SEL$margin_vs_targets_max_abs <- NA_real_
+  SEL$discrimination_source <- "not_scored_at_eicu"
+}
 
 # RESOLUTION IS EVALUATED AT EACH METHOD'S OWN NOISE-CALIBRATED TOLERANCE at
 # the configured quantile, signal level.
@@ -1545,7 +1641,12 @@ SEL$l3_n      <- vapply(SEL$method, own_l3, numeric(1), what = "n")
 SEL$bag_population <- "common"
 SEL$store_status   <- STORE_STATUS
 
-if (all(is.na(SEL$l3_median))) {
+if (SITE != "mimic") {
+  cat("  the selection rule is a training-site rule and is not formed at eICU;\n")
+  cat("  resolution and each method's own L3 distribution are reported.\n\n")
+  print(SEL[, c("method", "frac_unique_leader", "l3_median", "l3_p95", "l3_n")],
+        row.names = FALSE)
+} else if (all(is.na(SEL$l3_median))) {
   cat(sprintf("  no `%s` replicates: the stability axis cannot be scored and the\n",
               STAB_C))
   cat("  verdict is WITHHELD -- two axes out of three is not the rule.\n\n")
@@ -1567,6 +1668,7 @@ if (all(is.na(SEL$l3_median))) {
 save_table(run, SEL, "selection_inputs", subdir = "diagnostics")
 
 finalize_run(run, extra = list(
+  site = SITE,
   generator = basename(gen_d),
   store_status = STORE_STATUS,
   store_fingerprint = attr_key_hash(.fp),

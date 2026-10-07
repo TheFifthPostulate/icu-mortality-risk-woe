@@ -29,15 +29,17 @@
 # interaction smooths were fitted at MIMIC on full train and frozen; eICU
 # evaluates them per patient exactly as it evaluates every other smooth.
 #
-# LEVELS 2, 3 AND 3T DO NOT EXIST AT AN APPLY SITE, and not merely because they
-# would be expensive. THE ATTRIBUTION OF A GIVEN PATIENT IS DETERMINISTIC HERE.
-# Every parameter is frozen, so there is no estimation noise per patient to
-# measure; resampling the eICU EVALUATION cohort would change only which
-# patients enter a summary, not any individual attribution, and that is ordinary
-# sampling error of a mean rather than the estimator variability level 3 is
-# about. Level 3 is a property of the FITTING PROCEDURE and is fully answered at
-# the training site. It is not a site-transportable quantity and this script
-# does not pretend to produce one.
+# THIS SCRIPT IS THE SINGLE FROZEN-BUNDLE APPLICATION, AND ONLY THAT. Under the
+# frozen bundle the attribution of a given patient is deterministic, so this
+# script has no level 2, 3 or 3T to measure. CORRECTED 2026-10-06: the header
+# said these levels "do not exist at an apply site", and that was wrong. They
+# do not exist for the FROZEN BUNDLE; they exist for the fitting procedure, and
+# the fitting procedure can be measured at eICU by retraining on the MIMIC-IV
+# training bags and APPLYING each retrained model here. That is
+# `tests/attr_external_bags.R` (whole-bag refits on the internal run's 38 bags,
+# frozen final priors), consumed by `tests/attr_metrics.R --site eicu`, which
+# gives eICU distributions at L1, L2, L3, L3T, L3P and L4. This script's
+# matrices are that store's anchor, coordinate (0, 0, 0).
 #
 # LEVEL 4 TRANSPORTS FOR FREE, because it holds the data fixed and varies the
 # specification: apply two frozen arms to the same eICU rows and compare. That
@@ -455,8 +457,9 @@ transport_provenance <- function(mimic_run) {
     methods_match = setequal(mm_methods, .mw),
     mimic_basis = "out-of-fold 5-fold fits on MIMIC train (OOF priors, OOF GAMs, OOF boosters)",
     eicu_basis  = "single frozen full-train bundle applied once; final priors, final GAMs, final booster",
-    levels_present_eicu = "L1,L4",
-    levels_absent_eicu  = "L2,L3,L3T,L3P",
+    levels_present_in_frozen_application = "L1,L4",
+    levels_absent_in_frozen_application  = "L2,L3,L3T,L3P",
+    eicu_refit_levels = "L1,L2,L3,L3T,L3P,L4 in the attrextgen store (tests/attr_external_bags.R)",
     stringsAsFactors = FALSE)
 }
 if (is.null(MIMIC_RUN) || !dir.exists(MIMIC_RUN)) {
@@ -529,5 +532,5 @@ finalize_run(run, extra = list(
   # field that will be read as "nothing was checked" the next time an arm goes
   # missing, and the guard in the arm loop above is the real check now.
   n_arms = length(A),
-  levels_absent = "L2,L3,L3T (an apply site fits nothing)"))
+  levels_absent = "L2,L3,L3T,L3P from this frozen-bundle application; at eICU they are in the attrextgen store (tests/attr_external_bags.R)"))
 cat(sprintf("\nwritten: %s\n", run$path))

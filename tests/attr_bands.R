@@ -36,8 +36,20 @@ for (f in sort(list.files("R", pattern = "\\.R$", full.names = TRUE))) source(f)
 args <- commandArgs(trailingOnly = TRUE)
 .opt <- function(flag, default = NULL) { i <- match(flag, args); if (is.na(i) || i == length(args)) default else args[i + 1L] }
 STORE  <- .opt("--store", "out/runs/attrgen_20260909T115047")
-BUNDLE <- .opt("--bundle", yaml::read_yaml("config/internal.yml")$test_look$bundle)
-METHODS <- c("llr_full", "llr_meas", "llr_cond")
+# An eICU whole-bag store (tests/attr_external_bags.R, added 2026-10-06) names
+# the bundle it applied in its design.qs2; that bundle supplies the strata cut
+# points, and a different --bundle is refused. The internal store carries no
+# such field and keeps the configured default.
+STORE_DG <- if (file.exists(file.path(STORE, "design.qs2"))) qs2::qs_read(file.path(STORE, "design.qs2")) else NULL
+SITE   <- if (!is.null(STORE_DG$site)) STORE_DG$site else "mimic"
+BUNDLE <- .opt("--bundle", if (!is.null(STORE_DG$bundle)) STORE_DG$bundle else
+                 yaml::read_yaml("config/internal.yml")$test_look$bundle)
+if (!is.null(STORE_DG$bundle) &&
+    !identical(normalizePath(BUNDLE, mustWork = TRUE), normalizePath(STORE_DG$bundle, mustWork = TRUE))) {
+  stop("attr_bands: --bundle is not the bundle the store applied (", STORE_DG$bundle, ").", call. = FALSE)
+}
+# --methods (added 2026-10-06): the eICU store holds llr_full and llr_meas only.
+METHODS <- strsplit(.opt("--methods", "llr_full,llr_meas,llr_cond"), ",", fixed = TRUE)[[1]]
 Z <- c(0.025, 0.975)
 
 cfg_local <- load_config("config/config.yml")
@@ -129,7 +141,14 @@ save_table(run, do.call(rbind, W_SUM), "band_width_sum")
 save_table(run, do.call(rbind, RES), "leader_resolution")
 save_table(run, do.call(rbind, STR), "stratum_stability")
 save_table(run, do.call(rbind, RATIO), "ratio_post_vs_boot")
+.g <- gc(verbose = FALSE)
 finalize_run(run, extra = list(store = STORE, bundle = BUNDLE, methods = as.list(METHODS),
+                                site = SITE,
+                                posterior_basis = if (SITE == "eicu") "draws from the final bundle GAMs, applied at eICU"
+                                                  else "draws from the out-of-fold fits, MIMIC-IV training stays",
+                                bootstrap_basis = if (SITE == "eicu") "whole-bag refits on the internal bags, applied at eICU"
+                                                  else "fold-intersection bag refits, MIMIC-IV training stays, out of fold",
+                                r_max_used_gb = round(sum(.g[, ncol(.g)]) / 1024, 2),
                                 n_posterior = sum(mf$method == "llr_full" & mf$route == "posterior"),
                                 n_bootstrap = sum(mf$method == "llr_full" & mf$route == "bootstrap")))
 cat("\n=== band on the sum ===\n"); print(do.call(rbind, W_SUM), row.names = FALSE, digits = 3)
