@@ -1,7 +1,7 @@
 # A Composite ICU Mortality Score from Weights of Evidence
 
 This repository holds the code for the preprint *A Composite ICU Mortality Score from Weights of Evidence of First-Day
-Measurements and Interventions Estimated with Channel-Wise Additive Models* (medRxiv, link to follow). The score is built from the
+Measurements and Interventions Estimated with Channel-Wise Additive Models* (citation link to follow). The score is built from the
 first 24 hours of an ICU stay. We developed it on MIMIC-IV, and we validated it, frozen, on 207 hospitals of the eICU Collaborative
 Research Database.
 
