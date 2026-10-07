@@ -1,7 +1,7 @@
 # A Composite ICU Mortality Score from Weights of Evidence
 
 This repository holds the code for the preprint *A Composite ICU Mortality Score from Weights of Evidence of First-Day
-Measurements and Interventions Estimated with Channel-Wise Additive Models* (citation link to follow). The score is built from the
+Measurements and Interventions Estimated with Channel-Wise Additive Models* (medRxiv, link to follow). The score is built from the
 first 24 hours of an ICU stay. We developed it on MIMIC-IV, and we validated it, frozen, on 207 hospitals of the eICU Collaborative
 Research Database.
 
@@ -47,11 +47,16 @@ evidence rests on extrapolation of the fitted functions and carries a wide band.
 
 ## Key results
 
-**Discrimination and transport.** The evidence sums held their discrimination at eICU better than gradient-boosted trees. The joint
-evidence sum kept 90% of its above-chance AUPRC, against 76 to 83% for the boosters, although the boosters discriminated better
-within MIMIC-IV.
+**Discrimination and transport.** The evidence sums held their discrimination at eICU better than gradient-boosted trees. The sum of
+the paired weights of evidence, in which each measurement is modeled with its interventions, kept 90% of its above-chance AUPRC, against
+76 to 83% for the boosters, although the boosters discriminated better within MIMIC-IV. The eICU values are pooled over all eICU stays.
 
 ![Discrimination and transport](paper/figs/F18_discrimination_transport.png)
+
+Within the 137 eICU hospitals with at least 100 stays and 10 deaths, the paired evidence sum reached a median AUROC of 0.814 and a median
+AUPRC of 0.401, and the raw booster led it by a median of 0.023 AUROC and 0.038 AUPRC.
+
+![Within-hospital discrimination at eICU](paper/figs/F2_hospital_auroc_auprc.png)
 
 **Comparison with classical severity scores.** Recomputed from the same extraction, APACHE II and SOFA reached an AUPRC of 0.23 to 0.26
 at the MIMIC-IV test set, and the evidence sums 0.43 to 0.44.
@@ -69,28 +74,39 @@ against references of about 32 to 33%.
 ![Reference-risk quartiles](paper/figs/F11_reference_risk_strata.png)
 
 **One channel, term by term.** Each term of a channel model is drawn relative to a quiet day on the channel, and the weight of evidence
-of a stay is the reference evidence plus the value of each term. The figure shows the joint model of respiratory rate.
+of a stay is the reference evidence plus the value of each term. The figure shows the paired model of respiratory rate.
 
 ![Terms of the respiratory-rate channel](paper/figs/F15_channel_terms_resp_rate.png)
 
 **Measurements with their interventions.** For oxygen saturation, respiratory rate, heart rate and mean blood pressure, adding the
 intervention block raised the discrimination of the channel well above that of the measurement alone.
 
-![Per-channel AUROC, joint vs measurement-only](paper/figs/F6_signal_auroc_meas.png)
+![Per-channel AUROC, paired vs measurement](paper/figs/F6_signal_auroc_meas.png)
 
-**Reproducibility of per-patient attributions.** When the models were refitted on resampled training data, the leading channel of a
-patient changed for 17.4% of patients with the joint evidence model and for 23.2% with SHAP explanations of a booster, and the evidence
-model was the more stable on 702 of 703 paired retrainings.
+For mean blood pressure, the paired model gave less evidence to frequent hypotension than the measurement model, while its vasopressor
+terms carried evidence of their own: the evidence of a pressure held in range by a vasopressor moved from the pressure to the vasopressor.
+
+![Mean blood pressure and the vasopressor term](paper/figs/F19_mbp_measurement_and_vasopressor.png)
+
+**Reproducibility of per-patient attributions.** We refitted each method on 38 resampled subsets of the MIMIC-IV training data and
+compared its explanations of the same patients between two refits. At eICU, the same refits were applied to the eICU cohort. The leading
+channel of a patient changed for 17.4% of patients with the paired weights of evidence and for 23.2% with SHAP explanations of a booster
+at MIMIC-IV, and for 17.2% and 24.6% at eICU. The evidence model was the more stable on 702 of 703 paired retrainings at MIMIC-IV, on
+695 at eICU, and within 129 of the 137 eICU hospitals.
 
 ![Attribution stability](paper/figs/F9_attribution_stability.png)
 
-When the leading channel changed under resampling, it usually moved by one rank, and at the 95th percentile by four or five.
+When the leading channel changed under resampling, it usually moved by one rank, and at the 95th percentile by four or five, at both
+sites.
 
 ![Rank displacement under resampling](paper/figs/F13_rank_displacement_L3_changed.png)
 
-Between the two families, the leading channel of one model often sat far down the ranking of the other.
+Between the two families, the leading channel of one model often sat far down the ranking of the other. Refitted on the same subset,
+the paired weights of evidence and SHAP named different leading channels for 72.0% of patients at MIMIC-IV and 80.8% at eICU. Part of
+this is SHAP naming as the leader a channel the stay had not measured, mostly the verbal Glasgow component, for 12.5% of patients at
+MIMIC-IV and 35.8% at eICU; a channel that was not measured carries no weight of evidence.
 
-![Rank displacement between the joint model and SHAP](paper/figs/F12_rank_displacement_shap.png)
+![Rank displacement between the paired model and SHAP](paper/figs/F12_rank_displacement_shap.png)
 
 ## Implementation and auditability
 
@@ -297,7 +313,7 @@ The evaluation library `R/14_attribution_eval.R` is loaded by these scripts, and
 ### 10. Figures and the call-graph check (minutes)
 
 1. `Rscript paper/make_anchor_n.R`, `Rscript paper/make_figure_coefs.R`, `Rscript paper/make_anchored_curves.R`
-2. `Rscript paper/make_signal_auroc_meas.R`, which reproduces the exported joint per-channel AUROC exactly before it writes the
+2. `Rscript paper/make_signal_auroc_meas.R`, which reproduces the exported paired per-channel AUROC exactly before it writes the
    measurement-only one
 3. `Rscript paper/make_card_figure.R out/runs/card_<time>`
 4. `Rscript paper/make_figures.R` and `Rscript paper/make_atlas.R`, after setting the run identifiers at the top of each script
