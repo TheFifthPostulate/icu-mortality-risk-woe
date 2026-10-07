@@ -8,9 +8,9 @@
 # in sparse regions they are small cells.
 #
 # Each panel is one random variable of the channel:
-#   measurement terms: measurement model (green) and joint model (blue);
-#   intervention terms: intervention model (amber) and joint model (blue);
-#   unpaired channels: one model, which is both the measurement and the joint.
+#   measurement terms: measurement model (green) and paired model (blue);
+#   intervention terms: intervention model (amber) and paired model (blue);
+#   unpaired channels: one model, which is both the measurement and the paired.
 # Panel order is the reading order: propensities, tail extremities, trend,
 # then each paired intervention (exposure, exposure-adjusted intensity,
 # admission indicator).
@@ -34,8 +34,8 @@ cs  <- read.csv(file.path(G, "curve_summary.csv"), stringsAsFactors = FALSE)
 pc  <- read.csv("paper/figs/coefs/parametric_coefs.csv", stringsAsFactors = FALSE)
 
 INK2 <- "#52514e"; GRID <- "#e6e5e1"
-MODEL_COL <- c("Measurement model" = "#1baf7a", "Intervention model" = "#eda100", "Joint model" = "#2a78d6",
-               "Measurement model (unpaired: also the joint)" = "#1baf7a")
+MODEL_COL <- c("Measurement model" = "#1baf7a", "Intervention model" = "#eda100", "Paired model" = "#2a78d6",
+               "Measurement model (unpaired: also the paired)" = "#1baf7a")
 thm <- theme_minimal(base_size = 9) +
   theme(panel.grid.minor = element_blank(), panel.grid.major = element_line(colour = GRID, linewidth = 0.3),
         axis.text = element_text(colour = INK2), axis.title = element_text(colour = INK2, size = 8),
@@ -150,20 +150,20 @@ for (sg in names(CH)) {
   all_t <- c(terms, paras); all_t <- all_t[order(vapply(all_t, rank_of, numeric(1)))]
   panels <- lapply(all_t, function(t) {
     is_iv <- grepl("__", var_of(t))
-    models <- if (!paired) list("Measurement model (unpaired: also the joint)" = "meas")
-              else if (is_iv) list("Intervention model" = "intv", "Joint model" = "full")
-              else list("Measurement model" = "meas", "Joint model" = "full")
+    models <- if (!paired) list("Measurement model (unpaired: also the paired)" = "meas")
+              else if (is_iv) list("Intervention model" = "intv", "Paired model" = "full")
+              else list("Measurement model" = "meas", "Paired model" = "full")
     if (t %in% paras) return(coef_panel(sg, t, models))
     sh <- cs$shrunk_out[cs$key == paste(sg, jm, sep = "/") & cs$term == t]
     smooth_panel(sg, t, models, isTRUE(as.logical(sh)))
   })
   nr <- ceiling(length(panels) / 3)
   re <- REFE[REFE$signal == sg, ]; rv <- function(m) re$reference_evidence[re$model == m]
-  key_txt <- if (paired) sprintf(paste0("Green: measurement model.  Amber: intervention model.  Blue: joint model.
+  key_txt <- if (paired) sprintf(paste0("Green: measurement model.  Amber: intervention model.  Blue: paired model.
 ",
-                                        "Reference evidence (all terms at their reference): measurement %+.2f, intervention %+.2f, joint %+.2f nats."),
+                                        "Reference evidence (all terms at their reference): measurement %+.2f, intervention %+.2f, paired %+.2f nats."),
                                  rv("meas"), rv("intv"), rv("full"))
-             else sprintf(paste0("Green: measurement model, which is also the joint model (no paired intervention).
+             else sprintf(paste0("Green: measurement model, which is also the paired model (no paired intervention).
 ",
                                  "Reference evidence (all terms at their reference): %+.2f nats."), rv("meas"))
   p <- wrap_plots(panels, ncol = 3) +
@@ -184,14 +184,15 @@ tex <- c(
   "\\clearpage",
   "\\setcounter{figure}{0}",
   "\\renewcommand{\\thefigure}{D\\arabic{figure}}",
+  "\\renewcommand{\\theHfigure}{D\\arabic{figure}}",
   "\\section*{Appendix D. Atlas of the evidence functions}",
-  "\\label{sm:atlas}",
+  "\\makeatletter\\def\\@currentlabel{D}\\makeatother\\phantomsection\\label{sm:atlas}",
   "",
   paste("This appendix draws every fitted term of the final evidence models, one channel per page. Each panel is",
-        "one random variable of the channel. A measurement term is drawn under the measurement model and the joint",
-        "model, and an intervention term under the intervention model and the joint model, so the effect of adding",
+        "one random variable of the channel. A measurement term is drawn under the measurement model and the paired",
+        "model, and an intervention term under the intervention model and the paired model, so the effect of adding",
         "the other block can be read directly. A channel without a paired intervention has one model, which is both",
-        "its measurement model and its joint model.",
+        "its measurement model and its paired model.",
         "
 
 ",
@@ -211,7 +212,7 @@ tex <- c(
         "present at admission, with its 95\\% interval. The panels follow the reading order of the card: the",
         "deviation propensities, then the frequency-adjusted tail extremity, which is read after the propensity on",
         "its side, then the trend, then the terms of each paired intervention. A term marked as shrunk was removed",
-        "by the shrinkage basis in the joint model. The tail extremity of the Glasgow components is on the logit",
+        "by the shrinkage basis in the paired model. The tail extremity of the Glasgow components is on the logit",
         "scale of the proportional-odds residual (Equation~\\ref{eq:midpit}), and their trend is in score points.",
         "Their reference value of zero falls between the few values that the ordinal residual takes, so for the",
         "motor and verbal components the curve at the reference is interpolated between supported values."),
@@ -219,7 +220,7 @@ tex <- c(
 for (sg in pages) {
   tex <- c(tex, "\\begin{figure}[p]", "\\centering",
            sprintf("\\includegraphics[width=\\linewidth,height=0.92\\textheight,keepaspectratio]{figs/atlas/atlas_%s.pdf}", sg),
-           sprintf("\\caption{Evidence functions of %s.}", tolower(CH[[sg]])),
+           sprintf("\\caption{Evidence functions of %s.}", if (grepl("^Glasgow", CH[[sg]])) CH[[sg]] else tolower(CH[[sg]])),
            sprintf("\\label{fig:atlas_%s}", sg), "\\end{figure}", "")
 }
 writeLines(tex, "paper/appendix_atlas.tex")
