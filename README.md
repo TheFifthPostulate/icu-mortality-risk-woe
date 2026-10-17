@@ -29,7 +29,7 @@ The design rests on eight principles.
    same reading in every channel.
 4. **Each measurement gives one weight of evidence.** The composite score has as many components as there are chosen measurements,
    and the components have a fixed meaning rather than one assigned by an algorithmic allocation of a prediction.
-5. **No measurement ranked above another.** We report the weight of evidence of each measurement as it is, and the score does not rank one       measurement above another. Each weight of evidence is read individually, and it is not contrasted with the others by its relative strength    or contribution. This leaves the priority among the findings of a patient to the clinician. Section~\ref{sec:composite} gives the argument    for this choice and what it implies for reading the weights of evidence.
+5. **No measurement ranked above another.** We report the weight of evidence of each measurement as it is, and the score does not rank one       measurement above another. Each weight of evidence is read individually, and it is not contrasted with the others by its relative strength    or contribution. This leaves the priority among the findings of a patient to the clinician. Section 3.1 in the paper gives the argument       for this choice and what it implies for reading the weights of evidence.
 6. **The random variables are estimated as parameters with likelihood models.** A deviation propensity is the same kind of quantity
    for every measurement, so the propensity of creatinine can be placed beside that of mean blood pressure, while their raw deviation
    counts cannot. The likelihood models also account for differences in charting within and between sites.
