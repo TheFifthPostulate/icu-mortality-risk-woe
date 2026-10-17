@@ -14,8 +14,8 @@ observed mortality of the reference-population stratum into which the score of a
 
 ## Design philosophy
 
-We designed the score so that each of its parts carries a meaning that we chose before estimating it. Section 2 of the paper gives the
-argument for each principle.
+We designed the score so that each of its parts carries a meaning that we chose before estimating it.
+The design rests on eight principles.
 
 1. **The weight of evidence is the unit of the score.** Its sign states toward which outcome an aspect of the record points, and its
    magnitude states how far. Weights of evidence from different sources share this unit, so the subscores of the composite score can
@@ -29,12 +29,13 @@ argument for each principle.
    same reading in every channel.
 4. **Each measurement gives one weight of evidence.** The composite score has as many components as there are chosen measurements,
    and the components have a fixed meaning rather than one assigned by an algorithmic allocation of a prediction.
-5. **The random variables are estimated as parameters with likelihood models.** A deviation propensity is the same kind of quantity
+5. **No measurement ranked above another.** We report the weight of evidence of each measurement as it is, and the score does not rank one       measurement above another. Each weight of evidence is read individually, and it is not contrasted with the others by its relative strength    or contribution. This leaves the priority among the findings of a patient to the clinician. Section~\ref{sec:composite} gives the argument    for this choice and what it implies for reading the weights of evidence.
+6. **The random variables are estimated as parameters with likelihood models.** A deviation propensity is the same kind of quantity
    for every measurement, so the propensity of creatinine can be placed beside that of mean blood pressure, while their raw deviation
    counts cannot. The likelihood models also account for differences in charting within and between sites.
-6. **A channel that was not measured contributes nothing.** It receives a weight of evidence of zero, so missing data are neither
+7. **A channel that was not measured contributes nothing.** It receives a weight of evidence of zero, so missing data are neither
    imputed nor modeled.
-7. **Risk is reported against a reference population,** as the observed mortality of a frozen stratum of the score.
+8. **Risk is reported against a reference population,** as the observed mortality of a frozen stratum of the score.
 
 ## Reading one patient
 
